@@ -1,0 +1,17 @@
+{
+  "name": "bulk-image-downloader",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "archiver": "^7.0.1",
+    "express": "^4.19.2",
+    "node-fetch": "^3.3.2",
+    "pdf-lib": "^1.17.1",
+    "pdf2pic": "^3.1.1",
+    "puppeteer": "^22.15.0",
+    "uuid": "^9.0.1"
+  }
+}
