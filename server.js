@@ -9,6 +9,13 @@ import path from "path";
 import os from "os";
 import multer from "multer";
 import * as XLSX from "xlsx";
+import crypto from "crypto";
+
+const SKIP_EXTENSIONS = new Set([".svg", ".webp"]);
+
+function hashBuffer(buf) {
+  return crypto.createHash("sha256").update(buf).digest("hex");
+}
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -38,7 +45,7 @@ function log(job, message) {
 }
 
 // ---------- core per-row handlers ----------
-async function handlePdf(url, reqHeaders, workDir, label, archive) {
+async function handlePdf(url, reqHeaders, workDir, label, archive, seenHashes, job) {
   const resp = await fetch(url, { headers: reqHeaders });
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
   const pdfPath = path.join(workDir, `${label}-${uuid()}.pdf`);
@@ -55,10 +62,20 @@ async function handlePdf(url, reqHeaders, workDir, label, archive) {
     height: 2200,
   });
   const pageCount = await getPdfPageCount(pdfPath);
+  let kept = 0;
   for (let p = 1; p <= pageCount; p++) {
     const out = await converter(p, { responseType: "image" });
-    archive.append(fs.createReadStream(out.path), { name: `${label}/page-${p}.png` });
+    const buf = fs.readFileSync(out.path);
+    const hash = hashBuffer(buf);
+    if (seenHashes.has(hash)) {
+      log(job, `Skipped duplicate page image in "${label}" (page ${p}).`);
+      continue;
+    }
+    seenHashes.add(hash);
+    kept++;
+    archive.append(buf, { name: `${label}/page-${p}.png` });
   }
+  return kept;
 }
 
 async function getPdfPageCount(pdfPath) {
@@ -68,7 +85,7 @@ async function getPdfPageCount(pdfPath) {
   return doc.getPageCount();
 }
 
-async function handleHtmlPage(url, reqHeaders, browser, label, archive) {
+async function handleHtmlPage(url, reqHeaders, browser, label, archive, seenHashes, job) {
   const page = await browser.newPage();
   if (reqHeaders.Cookie) {
     const domain = new URL(url).hostname;
@@ -85,18 +102,36 @@ async function handleHtmlPage(url, reqHeaders, browser, label, archive) {
 
   const imgUrls = await page.$$eval("img", (imgs) => imgs.map((img) => img.src).filter(Boolean));
 
+  let kept = 0;
+  let skippedType = 0;
+  let skippedDupe = 0;
   for (let i = 0; i < imgUrls.length; i++) {
     try {
+      const rawExt = path.extname(new URL(imgUrls[i]).pathname).split("?")[0].toLowerCase();
+      if (SKIP_EXTENSIONS.has(rawExt)) {
+        skippedType++;
+        continue;
+      }
       const resp = await fetch(imgUrls[i], { headers: reqHeaders });
       if (!resp.ok) continue;
       const buf = Buffer.from(await resp.arrayBuffer());
-      const ext = path.extname(new URL(imgUrls[i]).pathname).split("?")[0] || ".jpg";
+      const hash = hashBuffer(buf);
+      if (seenHashes.has(hash)) {
+        skippedDupe++;
+        continue;
+      }
+      seenHashes.add(hash);
+      const ext = rawExt || ".jpg";
       archive.append(buf, { name: `${label}/img-${i + 1}${ext}` });
+      kept++;
     } catch {
       // skip broken image
     }
   }
+  if (skippedType) log(job, `Skipped ${skippedType} .svg/.webp image(s) in "${label}".`);
+  if (skippedDupe) log(job, `Skipped ${skippedDupe} duplicate image(s) in "${label}".`);
   await page.close();
+  return kept;
 }
 
 // ---------- job runner ----------
@@ -118,6 +153,7 @@ async function runJob(jobId, entries, cookie) {
   });
 
   let browser;
+  const seenHashes = new Set();
   try {
     for (let i = 0; i < entries.length; i++) {
       const entry = entries[i];
@@ -127,10 +163,10 @@ async function runJob(jobId, entries, cookie) {
       log(job, `Fetching "${label}"...`);
       try {
         if (url.toLowerCase().includes(".pdf")) {
-          await handlePdf(url, reqHeaders, workDir, label, archive);
+          await handlePdf(url, reqHeaders, workDir, label, archive, seenHashes, job);
         } else {
           browser = browser || (await puppeteer.launch({ args: ["--no-sandbox"] }));
-          await handleHtmlPage(url, reqHeaders, browser, label, archive);
+          await handleHtmlPage(url, reqHeaders, browser, label, archive, seenHashes, job);
         }
         log(job, `Done: "${label}"`);
       } catch (err) {
