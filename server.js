@@ -410,7 +410,7 @@ const HOMEPAGE_HTML = `<!DOCTYPE html>
             <div class="filename" id="filename"></div>
           </div>
           <input type="file" id="xlsxFile" accept=".xlsx,.xls" style="display:none" />
-          <p class="hint">First row is auto-detected as a header and skipped if column B isn't a link.</p>
+          <p class="hint">First row is auto-detected as a header and skipped if column B isn't a link. <a href="/sample-template.xlsx" style="color:var(--orange);">Download sample file</a> to see the expected format.</p>
         </div>
         <div class="field">
           <label>Session cookie (optional)</label>
@@ -591,6 +591,22 @@ https://.../admin/inspectionReports?id=...&type=..."></textarea>
 </script>
 </body>
 </html>`;
+
+app.get("/sample-template.xlsx", (_req, res) => {
+  const rows = [
+    ["Folder Name", "Image URL"],
+    ["CC260113075222233154", "https://reports.kuwycarcheck.com/image/upload/v1771642553/KUWY/CARCHECK/REPORTS/2026/02/21/CC260113075222233154/pdf_image/CC260113075222233154_2026_02_21_08_25.pdf"],
+    ["CC260113075222233154-admin", "https://report.kuwycarcheck.com/admin/inspectionReports?id=...&type=..."],
+  ];
+  const sheet = XLSX.utils.aoa_to_sheet(rows);
+  sheet["!cols"] = [{ wch: 28 }, { wch: 90 }];
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, sheet, "Reports");
+  const buf = XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
+  res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  res.setHeader("Content-Disposition", `attachment; filename="sample-template.xlsx"`);
+  res.send(buf);
+});
 
 app.get("/", (_req, res) => {
   res.send(HOMEPAGE_HTML);
