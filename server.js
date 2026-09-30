@@ -237,6 +237,103 @@ async function handleGenericDownload(url, reqHeaders, workDir, label, archive, s
   return saveFetchedContent(buf, contentType, workDir, label, archive, seenHashes, job);
 }
 
+// ---------- report-generation action links (e.g. ?action=generate_report&...) ----------
+// These endpoints may return either a raw file (PDF/image/zip) or an HTML report page
+// depending on the vendor, so this handler sniffs the actual response and adapts.
+function isReportActionLink(url) {
+  try {
+    const action = (new URL(url).searchParams.get("action") || "").toLowerCase();
+    return action.includes("report");
+  } catch {
+    return false;
+  }
+}
+
+// Used only by the smart-report handler below: does everything handleHtmlPage does (extract
+// embedded <img> tags) PLUS captures a full-page screenshot of the rendered report itself, so
+// both the individual images and a "whole report page" image end up in the zip. Kept as a
+// separate function so handleHtmlPage (used by the admin-report link) stays untouched.
+async function handleHtmlPageWithScreenshot(url, reqHeaders, browser, label, archive, seenHashes, job) {
+  const page = await browser.newPage();
+  if (reqHeaders.Cookie) {
+    const domain = new URL(url).hostname;
+    const cookies = reqHeaders.Cookie.split(";").map((c) => {
+      const [name, ...rest] = c.trim().split("=");
+      return { name, value: rest.join("="), domain, path: "/" };
+    });
+    await page.setCookie(...cookies);
+  }
+  if (reqHeaders["Authorization"]) {
+    await page.setExtraHTTPHeaders({ Authorization: reqHeaders["Authorization"] });
+  }
+  await page.goto(url, { waitUntil: "networkidle2", timeout: 60000 });
+
+  const imgUrls = await page.$$eval("img", (imgs) => imgs.map((img) => img.src).filter(Boolean));
+
+  let kept = 0;
+  let skippedType = 0;
+  let skippedDupe = 0;
+  for (let i = 0; i < imgUrls.length; i++) {
+    try {
+      const rawExt = path.extname(new URL(imgUrls[i]).pathname).split("?")[0].toLowerCase();
+      if (SKIP_EXTENSIONS.has(rawExt)) {
+        skippedType++;
+        continue;
+      }
+      const resp = await fetch(imgUrls[i], { headers: reqHeaders });
+      if (!resp.ok) continue;
+      const buf = Buffer.from(await resp.arrayBuffer());
+      const hash = hashBuffer(buf);
+      if (seenHashes.has(hash)) {
+        skippedDupe++;
+        continue;
+      }
+      seenHashes.add(hash);
+      const ext = rawExt || ".jpg";
+      archive.append(buf, { name: `${label}/img-${i + 1}${ext}` });
+      kept++;
+    } catch {
+      // skip broken image
+    }
+  }
+
+  // Capture the rendered report itself as a full-page image, in addition to the embedded images above.
+  let pageShots = 0;
+  try {
+    const shotBuf = await page.screenshot({ fullPage: true, type: "png" });
+    const shotHash = hashBuffer(shotBuf);
+    if (!seenHashes.has(shotHash)) {
+      seenHashes.add(shotHash);
+      archive.append(shotBuf, { name: `${label}/report-page-1.png` });
+      pageShots = 1;
+    }
+  } catch (err) {
+    log(job, `Could not capture full-page screenshot for "${label}": ${err.message}`);
+  }
+
+  if (skippedType) log(job, `Skipped ${skippedType} .svg/.webp image(s) in "${label}".`);
+  if (skippedDupe) log(job, `Skipped ${skippedDupe} duplicate image(s) in "${label}".`);
+  log(job, `Saved ${kept} embedded image(s) and ${pageShots} report-page screenshot(s) for "${label}".`);
+  await page.close();
+  return kept + pageShots;
+}
+
+async function handleSmartReport(url, reqHeaders, workDir, label, archive, seenHashes, job, ensureBrowser) {
+  const headers = { ...BROWSER_LIKE_HEADERS, ...reqHeaders };
+  const resp = await fetch(url, { headers, redirect: "follow" });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  const contentType = (resp.headers.get("content-type") || "").toLowerCase();
+  const buf = Buffer.from(await resp.arrayBuffer());
+
+  if (contentType.includes("text/html")) {
+    log(job, `"${label}" returned an HTML report page — rendering it in a browser to pull images and the report page itself.`);
+    const browser = await ensureBrowser();
+    return handleHtmlPageWithScreenshot(url, reqHeaders, browser, label, archive, seenHashes, job);
+  }
+
+  return saveFetchedContent(buf, contentType, workDir, label, archive, seenHashes, job);
+}
+
 // ---------- job runner ----------
 async function runJob(jobId, entries, cookie) {
   const job = jobs.get(jobId);
@@ -256,6 +353,10 @@ async function runJob(jobId, entries, cookie) {
   });
 
   let browser;
+  async function ensureBrowser() {
+    browser = browser || (await puppeteer.launch({ args: ["--no-sandbox"] }));
+    return browser;
+  }
   const seenHashes = new Set();
   try {
     for (let i = 0; i < entries.length; i++) {
@@ -271,9 +372,11 @@ async function runJob(jobId, entries, cookie) {
           await handlePdf(url, reqHeaders, workDir, label, archive, seenHashes, job);
         } else if (isDirectDownloadLink(url)) {
           await handleGenericDownload(url, reqHeaders, workDir, label, archive, seenHashes, job);
+        } else if (isReportActionLink(url)) {
+          await handleSmartReport(url, reqHeaders, workDir, label, archive, seenHashes, job, ensureBrowser);
         } else {
-          browser = browser || (await puppeteer.launch({ args: ["--no-sandbox"] }));
-          await handleHtmlPage(url, reqHeaders, browser, label, archive, seenHashes, job);
+          const br = await ensureBrowser();
+          await handleHtmlPage(url, reqHeaders, br, label, archive, seenHashes, job);
         }
         log(job, `Done: "${label}"`);
       } catch (err) {
