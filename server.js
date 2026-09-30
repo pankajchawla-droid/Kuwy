@@ -268,20 +268,60 @@ async function handleHtmlPageWithScreenshot(url, reqHeaders, browser, label, arc
   }
   await page.goto(url, { waitUntil: "networkidle2", timeout: 60000 });
 
-  const imgUrls = await page.$$eval("img", (imgs) => imgs.map((img) => img.src).filter(Boolean));
+  // Give lazy-loaded images (which only fetch their real src on scroll/intersection) a chance to load.
+  await page.evaluate(async () => {
+    window.scrollTo(0, document.body.scrollHeight);
+    await new Promise((r) => setTimeout(r, 800));
+    window.scrollTo(0, 0);
+  });
+  await new Promise((r) => setTimeout(r, 300));
 
+  // Read the real image URL even for lazy-loaded images, which often keep it in a data-* attribute
+  // instead of src until the image scrolls into view.
+  const imgUrls = await page.$$eval("img", (imgs) =>
+    imgs
+      .map((img) => img.currentSrc || img.src || img.dataset.src || img.dataset.lazySrc || img.dataset.original || "")
+      .filter((src) => src && !src.startsWith("about:blank"))
+  );
+
+  const pageOrigin = new URL(url).origin;
   let kept = 0;
   let skippedType = 0;
   let skippedDupe = 0;
+  let failedFetch = 0;
+  const failureSamples = [];
+
   for (let i = 0; i < imgUrls.length; i++) {
+    const imgUrl = imgUrls[i];
     try {
-      const rawExt = path.extname(new URL(imgUrls[i]).pathname).split("?")[0].toLowerCase();
+      if (imgUrl.startsWith("data:")) {
+        // Inline base64 image — no fetch needed, decode directly.
+        const match = imgUrl.match(/^data:image\/([a-zA-Z0-9.+-]+);base64,(.+)$/);
+        if (!match) continue;
+        const ext = "." + match[1].split("+")[0];
+        if (SKIP_EXTENSIONS.has(ext)) { skippedType++; continue; }
+        const buf = Buffer.from(match[2], "base64");
+        const hash = hashBuffer(buf);
+        if (seenHashes.has(hash)) { skippedDupe++; continue; }
+        seenHashes.add(hash);
+        archive.append(buf, { name: `${label}/img-${i + 1}${ext}` });
+        kept++;
+        continue;
+      }
+
+      const rawExt = path.extname(new URL(imgUrl).pathname).split("?")[0].toLowerCase();
       if (SKIP_EXTENSIONS.has(rawExt)) {
         skippedType++;
         continue;
       }
-      const resp = await fetch(imgUrls[i], { headers: reqHeaders });
-      if (!resp.ok) continue;
+      const resp = await fetch(imgUrl, {
+        headers: { ...BROWSER_LIKE_HEADERS, Referer: pageOrigin, ...reqHeaders },
+      });
+      if (!resp.ok) {
+        failedFetch++;
+        if (failureSamples.length < 3) failureSamples.push(`HTTP ${resp.status} on ${imgUrl}`);
+        continue;
+      }
       const buf = Buffer.from(await resp.arrayBuffer());
       const hash = hashBuffer(buf);
       if (seenHashes.has(hash)) {
@@ -292,8 +332,9 @@ async function handleHtmlPageWithScreenshot(url, reqHeaders, browser, label, arc
       const ext = rawExt || ".jpg";
       archive.append(buf, { name: `${label}/img-${i + 1}${ext}` });
       kept++;
-    } catch {
-      // skip broken image
+    } catch (err) {
+      failedFetch++;
+      if (failureSamples.length < 3) failureSamples.push(`${err.message} on ${imgUrl}`);
     }
   }
 
@@ -313,6 +354,12 @@ async function handleHtmlPageWithScreenshot(url, reqHeaders, browser, label, arc
 
   if (skippedType) log(job, `Skipped ${skippedType} .svg/.webp image(s) in "${label}".`);
   if (skippedDupe) log(job, `Skipped ${skippedDupe} duplicate image(s) in "${label}".`);
+  if (failedFetch) {
+    log(job, `${failedFetch} embedded image(s) in "${label}" failed to download. Examples: ${failureSamples.join("; ")}`);
+  }
+  if (imgUrls.length === 0) {
+    log(job, `No <img> tags found on "${label}" — images on that page may be CSS backgrounds or inside an iframe, which this tool doesn't scan yet.`);
+  }
   log(job, `Saved ${kept} embedded image(s) and ${pageShots} report-page screenshot(s) for "${label}".`);
   await page.close();
   return kept + pageShots;
