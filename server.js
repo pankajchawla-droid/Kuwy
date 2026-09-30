@@ -134,6 +134,77 @@ async function handleHtmlPage(url, reqHeaders, browser, label, archive, seenHash
   return kept;
 }
 
+// ---------- Nextcloud / ownCloud public share links ----------
+function isNextcloudShare(url) {
+  // Matches both classic "/index.php/s/<token>" and pretty-URL "/s/<token>" share links.
+  return /\/(?:index\.php\/)?s\/[A-Za-z0-9_-]+(?:[/?#]|$)/i.test(url);
+}
+
+async function handleNextcloudShare(url, reqHeaders, workDir, label, archive, seenHashes, job) {
+  const downloadUrl = url.replace(/\/+$/, "") + "/download";
+  const resp = await fetch(downloadUrl, { headers: reqHeaders, redirect: "follow" });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  const contentType = (resp.headers.get("content-type") || "").toLowerCase();
+  const buf = Buffer.from(await resp.arrayBuffer());
+
+  if (contentType.includes("application/zip") || contentType.includes("application/octet-stream")) {
+    const isZip = buf.length > 4 && buf[0] === 0x50 && buf[1] === 0x4b; // "PK" zip signature
+    if (isZip) {
+      const AdmZip = (await import("adm-zip")).default;
+      const zip = new AdmZip(buf);
+      const zipEntries = zip.getEntries();
+      let kept = 0, skippedType = 0, skippedDupe = 0;
+      for (const entry of zipEntries) {
+        if (entry.isDirectory) continue;
+        const ext = path.extname(entry.entryName).toLowerCase();
+        if (SKIP_EXTENSIONS.has(ext)) { skippedType++; continue; }
+        if (![".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".pdf"].includes(ext)) continue;
+        const entryBuf = entry.getData();
+        const hash = hashBuffer(entryBuf);
+        if (seenHashes.has(hash)) { skippedDupe++; continue; }
+        seenHashes.add(hash);
+        archive.append(entryBuf, { name: `${label}/${path.basename(entry.entryName)}` });
+        kept++;
+      }
+      if (skippedType) log(job, `Skipped ${skippedType} .svg/.webp file(s) in "${label}".`);
+      if (skippedDupe) log(job, `Skipped ${skippedDupe} duplicate file(s) in "${label}".`);
+      log(job, `Extracted ${kept} file(s) from shared folder "${label}".`);
+      return kept;
+    }
+  }
+
+  if (contentType.includes("application/pdf") || buf.slice(0, 4).toString() === "%PDF") {
+    const pdfPath = path.join(workDir, `${label}-${uuid()}.pdf`);
+    fs.writeFileSync(pdfPath, buf);
+    archive.append(fs.createReadStream(pdfPath), { name: `${label}/original.pdf` });
+    const converter = fromPath(pdfPath, { density: 200, saveFilename: label, savePath: workDir, format: "png", width: 1600, height: 2200 });
+    const pageCount = await getPdfPageCount(pdfPath);
+    let kept = 0;
+    for (let p = 1; p <= pageCount; p++) {
+      const out = await converter(p, { responseType: "image" });
+      const pageBuf = fs.readFileSync(out.path);
+      const hash = hashBuffer(pageBuf);
+      if (seenHashes.has(hash)) { log(job, `Skipped duplicate page image in "${label}" (page ${p}).`); continue; }
+      seenHashes.add(hash);
+      archive.append(pageBuf, { name: `${label}/page-${p}.png` });
+      kept++;
+    }
+    return kept;
+  }
+
+  if (contentType.startsWith("image/")) {
+    const ext = "." + (contentType.split("/")[1] || "jpg").split(";")[0];
+    if (SKIP_EXTENSIONS.has(ext)) { log(job, `Skipped .svg/.webp file in "${label}".`); return 0; }
+    const hash = hashBuffer(buf);
+    if (seenHashes.has(hash)) { log(job, `Skipped duplicate file in "${label}".`); return 0; }
+    seenHashes.add(hash);
+    archive.append(buf, { name: `${label}/image${ext}` });
+    return 1;
+  }
+
+  throw new Error(`Unrecognized share content-type: ${contentType || "unknown"}`);
+}
+
 // ---------- job runner ----------
 async function runJob(jobId, entries, cookie) {
   const job = jobs.get(jobId);
@@ -162,7 +233,9 @@ async function runJob(jobId, entries, cookie) {
       job.current = i + 1;
       log(job, `Fetching "${label}"...`);
       try {
-        if (url.toLowerCase().includes(".pdf")) {
+        if (isNextcloudShare(url)) {
+          await handleNextcloudShare(url, reqHeaders, workDir, label, archive, seenHashes, job);
+        } else if (url.toLowerCase().includes(".pdf")) {
           await handlePdf(url, reqHeaders, workDir, label, archive, seenHashes, job);
         } else {
           browser = browser || (await puppeteer.launch({ args: ["--no-sandbox"] }));
@@ -217,7 +290,7 @@ app.post("/jobs/from-excel", upload.single("file"), async (req, res) => {
   }
 
   const entries = rows
-    .map((r) => ({ folder: r[0], url: r[1] }))
+    .map((r) => ({ folder: r[0], url: String(r[1] || "").trim() }))
     .filter((r) => r.url && /^https?:\/\//i.test(String(r.url)));
 
   if (entries.length === 0) {
@@ -241,7 +314,7 @@ app.post("/jobs/from-urls", async (req, res) => {
   if (!Array.isArray(urls) || urls.length === 0) {
     return res.status(400).json({ error: "Provide 'urls' as a non-empty array." });
   }
-  const entries = urls.map((u, i) => ({ folder: `item-${i + 1}`, url: u }));
+  const entries = urls.map((u, i) => ({ folder: `item-${i + 1}`, url: String(u || "").trim() }));
   const jobId = startJob(entries);
   runJob(jobId, entries, cookie || "").catch((err) => {
     const job = jobs.get(jobId);
