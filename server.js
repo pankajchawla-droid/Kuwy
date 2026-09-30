@@ -142,7 +142,12 @@ function isNextcloudShare(url) {
 
 async function handleNextcloudShare(url, reqHeaders, workDir, label, archive, seenHashes, job) {
   const downloadUrl = url.replace(/\/+$/, "") + "/download";
-  const resp = await fetch(downloadUrl, { headers: reqHeaders, redirect: "follow" });
+  const browserLikeHeaders = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Accept": "*/*",
+    ...reqHeaders,
+  };
+  const resp = await fetch(downloadUrl, { headers: browserLikeHeaders, redirect: "follow" });
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
   const contentType = (resp.headers.get("content-type") || "").toLowerCase();
   const buf = Buffer.from(await resp.arrayBuffer());
