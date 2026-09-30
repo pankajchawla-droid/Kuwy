@@ -140,18 +140,26 @@ function isNextcloudShare(url) {
   return /\/(?:index\.php\/)?s\/[A-Za-z0-9_-]+(?:[/?#]|$)/i.test(url);
 }
 
-async function handleNextcloudShare(url, reqHeaders, workDir, label, archive, seenHashes, job) {
-  const downloadUrl = url.replace(/\/+$/, "") + "/download";
-  const browserLikeHeaders = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    "Accept": "*/*",
-    ...reqHeaders,
-  };
-  const resp = await fetch(downloadUrl, { headers: browserLikeHeaders, redirect: "follow" });
-  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-  const contentType = (resp.headers.get("content-type") || "").toLowerCase();
-  const buf = Buffer.from(await resp.arrayBuffer());
+// ---------- generic "direct file endpoint" links (any vendor whose URL is clearly ----------
+// ---------- a raw-file download rather than an HTML page — e.g. /export/DownloadFiles/123 ----------
+function isDirectDownloadLink(url) {
+  try {
+    const p = new URL(url).pathname.toLowerCase();
+    return p.includes("download");
+  } catch {
+    return false;
+  }
+}
 
+const BROWSER_LIKE_HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+  "Accept": "*/*",
+};
+
+// Given an already-fetched buffer + its content-type, save it into the archive the right way
+// (folder-zip / single PDF / single image). Shared by the Nextcloud handler and the generic
+// direct-download handler so both link types get identical, tested handling.
+async function saveFetchedContent(buf, contentType, workDir, label, archive, seenHashes, job) {
   if (contentType.includes("application/zip") || contentType.includes("application/octet-stream")) {
     const isZip = buf.length > 4 && buf[0] === 0x50 && buf[1] === 0x4b; // "PK" zip signature
     if (isZip) {
@@ -207,7 +215,26 @@ async function handleNextcloudShare(url, reqHeaders, workDir, label, archive, se
     return 1;
   }
 
-  throw new Error(`Unrecognized share content-type: ${contentType || "unknown"}`);
+  throw new Error(`Unrecognized content-type for direct download: ${contentType || "unknown"}`);
+}
+
+async function handleNextcloudShare(url, reqHeaders, workDir, label, archive, seenHashes, job) {
+  const downloadUrl = url.replace(/\/+$/, "") + "/download";
+  const headers = { ...BROWSER_LIKE_HEADERS, ...reqHeaders };
+  const resp = await fetch(downloadUrl, { headers, redirect: "follow" });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  const contentType = (resp.headers.get("content-type") || "").toLowerCase();
+  const buf = Buffer.from(await resp.arrayBuffer());
+  return saveFetchedContent(buf, contentType, workDir, label, archive, seenHashes, job);
+}
+
+async function handleGenericDownload(url, reqHeaders, workDir, label, archive, seenHashes, job) {
+  const headers = { ...BROWSER_LIKE_HEADERS, ...reqHeaders };
+  const resp = await fetch(url, { headers, redirect: "follow" });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  const contentType = (resp.headers.get("content-type") || "").toLowerCase();
+  const buf = Buffer.from(await resp.arrayBuffer());
+  return saveFetchedContent(buf, contentType, workDir, label, archive, seenHashes, job);
 }
 
 // ---------- job runner ----------
@@ -242,6 +269,8 @@ async function runJob(jobId, entries, cookie) {
           await handleNextcloudShare(url, reqHeaders, workDir, label, archive, seenHashes, job);
         } else if (url.toLowerCase().includes(".pdf")) {
           await handlePdf(url, reqHeaders, workDir, label, archive, seenHashes, job);
+        } else if (isDirectDownloadLink(url)) {
+          await handleGenericDownload(url, reqHeaders, workDir, label, archive, seenHashes, job);
         } else {
           browser = browser || (await puppeteer.launch({ args: ["--no-sandbox"] }));
           await handleHtmlPage(url, reqHeaders, browser, label, archive, seenHashes, job);
