@@ -276,23 +276,85 @@ async function handleHtmlPageWithScreenshot(url, reqHeaders, browser, label, arc
   });
   await new Promise((r) => setTimeout(r, 300));
 
-  // Read the real image URL even for lazy-loaded images, which often keep it in a data-* attribute
-  // instead of src until the image scrolls into view.
-  const imgUrls = await page.$$eval("img", (imgs) =>
-    imgs
-      .map((img) => img.currentSrc || img.src || img.dataset.src || img.dataset.lazySrc || img.dataset.original || "")
-      .filter((src) => src && !src.startsWith("about:blank"))
-  );
+  // Scan every frame on the page (the main page plus any iframes — Puppeteer can read into
+  // iframes even cross-origin ones, unlike a normal in-page script). For each frame, collect
+  // both <img> sources (including lazy-load data-* attributes) and CSS background-image URLs,
+  // since dashboard-style reports often use one or the other instead of plain <img> tags.
+  const candidates = []; // { rawUrl, frameOrigin, frameUrl }
+  for (const frame of page.frames()) {
+    if (frame.isDetached()) continue;
+    let frameUrl;
+    try {
+      frameUrl = frame.url();
+      if (!frameUrl || frameUrl === "about:blank") continue;
+    } catch {
+      continue;
+    }
+    let frameOrigin;
+    try {
+      frameOrigin = new URL(frameUrl).origin;
+    } catch {
+      continue;
+    }
 
-  const pageOrigin = new URL(url).origin;
+    let imgSrcs = [];
+    let bgUrls = [];
+    try {
+      imgSrcs = await frame.$$eval("img", (imgs) =>
+        imgs
+          .map((img) => img.currentSrc || img.src || img.dataset.src || img.dataset.lazySrc || img.dataset.original || "")
+          .filter((src) => src && !src.startsWith("about:blank"))
+      );
+    } catch {
+      // frame may have navigated away or be inaccessible — skip its <img> tags
+    }
+    try {
+      bgUrls = await frame.evaluate(() => {
+        const found = [];
+        document.querySelectorAll("*").forEach((el) => {
+          const bg = getComputedStyle(el).backgroundImage;
+          if (bg && bg !== "none") {
+            const matches = bg.match(/url\(["']?([^"')]+)["']?\)/g) || [];
+            matches.forEach((m) => {
+              const u = m.replace(/^url\(["']?/, "").replace(/["']?\)$/, "");
+              if (u) found.push(u);
+            });
+          }
+        });
+        return found;
+      });
+    } catch {
+      // frame may not allow style inspection (rare) — skip background-image scan for it
+    }
+
+    for (const src of [...imgSrcs, ...bgUrls]) {
+      candidates.push({ rawUrl: src, frameOrigin, frameUrl });
+    }
+  }
+
+  // Resolve to absolute URLs (relative to the frame that referenced them) and drop exact-URL duplicates.
+  const seenUrls = new Set();
+  const resolved = [];
+  for (const c of candidates) {
+    let absoluteUrl;
+    try {
+      absoluteUrl = c.rawUrl.startsWith("data:") ? c.rawUrl : new URL(c.rawUrl, c.frameUrl).href;
+    } catch {
+      continue;
+    }
+    if (seenUrls.has(absoluteUrl)) continue;
+    seenUrls.add(absoluteUrl);
+    resolved.push({ url: absoluteUrl, frameOrigin: c.frameOrigin });
+  }
+
   let kept = 0;
   let skippedType = 0;
   let skippedDupe = 0;
   let failedFetch = 0;
   const failureSamples = [];
 
-  for (let i = 0; i < imgUrls.length; i++) {
-    const imgUrl = imgUrls[i];
+  for (let i = 0; i < resolved.length; i++) {
+    const { url: imgUrl, frameOrigin } = resolved[i];
     try {
       if (imgUrl.startsWith("data:")) {
         // Inline base64 image — no fetch needed, decode directly.
@@ -315,7 +377,7 @@ async function handleHtmlPageWithScreenshot(url, reqHeaders, browser, label, arc
         continue;
       }
       const resp = await fetch(imgUrl, {
-        headers: { ...BROWSER_LIKE_HEADERS, Referer: pageOrigin, ...reqHeaders },
+        headers: { ...BROWSER_LIKE_HEADERS, Referer: frameOrigin, ...reqHeaders },
       });
       if (!resp.ok) {
         failedFetch++;
@@ -357,8 +419,8 @@ async function handleHtmlPageWithScreenshot(url, reqHeaders, browser, label, arc
   if (failedFetch) {
     log(job, `${failedFetch} embedded image(s) in "${label}" failed to download. Examples: ${failureSamples.join("; ")}`);
   }
-  if (imgUrls.length === 0) {
-    log(job, `No <img> tags found on "${label}" — images on that page may be CSS backgrounds or inside an iframe, which this tool doesn't scan yet.`);
+  if (resolved.length === 0) {
+    log(job, `No images found on "${label}" (checked <img> tags, lazy-load attributes, CSS backgrounds, and iframes).`);
   }
   log(job, `Saved ${kept} embedded image(s) and ${pageShots} report-page screenshot(s) for "${label}".`);
   await page.close();
