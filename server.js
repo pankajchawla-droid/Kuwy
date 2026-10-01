@@ -141,11 +141,14 @@ function isNextcloudShare(url) {
 }
 
 // ---------- generic "direct file endpoint" links (any vendor whose URL is clearly ----------
-// ---------- a raw-file download rather than an HTML page — e.g. /export/DownloadFiles/123 ----------
+// ---------- a raw-file download rather than an HTML page — e.g. /export/DownloadFiles/123, ----------
+// ---------- or a query-string action like ?action=download_case_images ----------
 function isDirectDownloadLink(url) {
   try {
-    const p = new URL(url).pathname.toLowerCase();
-    return p.includes("download");
+    const u = new URL(url);
+    const p = u.pathname.toLowerCase();
+    const action = (u.searchParams.get("action") || "").toLowerCase();
+    return p.includes("download") || action.includes("download");
   } catch {
     return false;
   }
