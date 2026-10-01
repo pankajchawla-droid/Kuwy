@@ -10,6 +10,10 @@ import os from "os";
 import multer from "multer";
 import * as XLSX from "xlsx";
 import crypto from "crypto";
+import { execFile } from "child_process";
+import { promisify } from "util";
+
+const execFileAsync = promisify(execFile);
 
 const SKIP_EXTENSIONS = new Set([".svg", ".webp"]);
 
@@ -205,6 +209,35 @@ async function saveFetchedContent(buf, contentType, workDir, label, archive, see
       archive.append(pageBuf, { name: `${label}/page-${p}.png` });
       kept++;
     }
+
+    // In addition to full-page renders above, also pull out the individual photos embedded
+    // inside the PDF itself (e.g. inspection photos), as their own separate image files.
+    try {
+      const extractPrefix = path.join(workDir, `${label}-embedded-${uuid()}`);
+      await execFileAsync("pdfimages", ["-all", pdfPath, extractPrefix]);
+      const dir = path.dirname(extractPrefix);
+      const prefixName = path.basename(extractPrefix);
+      const extractedFiles = fs.readdirSync(dir).filter((f) => f.startsWith(prefixName)).sort();
+      let embeddedKept = 0, embeddedSkippedType = 0, embeddedSkippedDupe = 0;
+      for (const file of extractedFiles) {
+        const ext = path.extname(file).toLowerCase();
+        if (SKIP_EXTENSIONS.has(ext)) { embeddedSkippedType++; continue; }
+        const filePath = path.join(dir, file);
+        const fileBuf = fs.readFileSync(filePath);
+        const hash = hashBuffer(fileBuf);
+        if (seenHashes.has(hash)) { embeddedSkippedDupe++; continue; }
+        seenHashes.add(hash);
+        archive.append(fileBuf, { name: `${label}/img-${embeddedKept + 1}${ext}` });
+        embeddedKept++;
+      }
+      if (embeddedSkippedType) log(job, `Skipped ${embeddedSkippedType} embedded .svg/.webp image(s) in "${label}".`);
+      if (embeddedSkippedDupe) log(job, `Skipped ${embeddedSkippedDupe} duplicate embedded image(s) in "${label}".`);
+      log(job, `Extracted ${embeddedKept} embedded image(s) from PDF "${label}" (in addition to ${kept} page render(s)).`);
+      kept += embeddedKept;
+    } catch (err) {
+      log(job, `Could not extract embedded images from "${label}" PDF: ${err.message}`);
+    }
+
     return kept;
   }
 
