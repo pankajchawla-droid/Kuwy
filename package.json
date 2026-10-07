@@ -9,10 +9,12 @@
     "adm-zip": "^0.5.16",
     "archiver": "^7.0.1",
     "express": "^4.19.2",
+    "jpeg-js": "^0.4.4",
     "multer": "^2.0.1",
     "node-fetch": "^3.3.2",
     "pdf-lib": "^1.17.1",
     "pdf2pic": "^3.1.1",
+    "pngjs": "^7.0.0",
     "puppeteer": "^22.15.0",
     "uuid": "^9.0.1",
     "xlsx": "^0.18.5"

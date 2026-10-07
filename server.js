@@ -203,6 +203,49 @@ function readImageDimensions(buf) {
   return null;
 }
 
+// Minimum number of distinct colors (after quantizing) an image needs to be treated as a
+// real photo rather than template chrome (logos, flat-color bars, icons). Real photos have
+// rich, continuous-tone detail even at modest size; flat graphics use only a handful of
+// colors no matter how large they're rendered. Tune if real low-detail photos get dropped,
+// or flat graphics still slip through.
+const MIN_DISTINCT_COLORS = 40;
+
+// Decodes a PNG/JPEG and returns how many visually-distinct colors it contains (sampled and
+// quantized for speed), or null if the format isn't supported / decoding fails — callers
+// should treat null as "keep the image" rather than risk dropping real content.
+async function countDistinctColors(buf, ext) {
+  try {
+    let width, height, data; // data: flat RGBA (or RGB) byte array
+    if (ext === ".png") {
+      const { PNG } = await import("pngjs");
+      const png = PNG.sync.read(buf);
+      width = png.width; height = png.height; data = png.data; // RGBA
+    } else if (ext === ".jpg" || ext === ".jpeg") {
+      const jpeg = (await import("jpeg-js")).default;
+      const decoded = jpeg.decode(buf, { useTArray: true });
+      width = decoded.width; height = decoded.height; data = decoded.data; // RGBA
+    } else {
+      return null; // unsupported format for decoding (e.g. ppm/jp2 from pdfimages) — keep it
+    }
+
+    const totalPixels = width * height;
+    if (totalPixels === 0) return 0;
+    const channels = data.length / totalPixels; // 4 for RGBA, 3 for RGB
+    const maxSamples = 4000;
+    const step = Math.max(1, Math.floor(totalPixels / maxSamples));
+    const seen = new Set();
+    for (let i = 0; i < totalPixels; i += step) {
+      const off = i * channels;
+      // Quantize each channel to collapse near-identical shades (compression noise, anti-aliasing).
+      const r = data[off] >> 4, g = data[off + 1] >> 4, b = data[off + 2] >> 4;
+      seen.add((r << 8) | (g << 4) | b);
+    }
+    return seen.size;
+  } catch {
+    return null;
+  }
+}
+
 async function saveFetchedContent(buf, contentType, workDir, label, archive, seenHashes, job) {
   if (contentType.includes("application/zip") || contentType.includes("application/octet-stream")) {
     const isZip = buf.length > 4 && buf[0] === 0x50 && buf[1] === 0x4b; // "PK" zip signature
@@ -233,7 +276,6 @@ async function saveFetchedContent(buf, contentType, workDir, label, archive, see
   if (contentType.includes("application/pdf") || buf.slice(0, 4).toString() === "%PDF") {
     const pdfPath = path.join(workDir, `${label}-${uuid()}.pdf`);
     fs.writeFileSync(pdfPath, buf);
-    archive.append(fs.createReadStream(pdfPath), { name: `${label}/original.pdf` });
     const converter = fromPath(pdfPath, { density: 200, saveFilename: label, savePath: workDir, format: "png", width: 1600, height: 2200 });
     const pageCount = await getPdfPageCount(pdfPath);
     let kept = 0;
@@ -255,7 +297,7 @@ async function saveFetchedContent(buf, contentType, workDir, label, archive, see
       const dir = path.dirname(extractPrefix);
       const prefixName = path.basename(extractPrefix);
       const extractedFiles = fs.readdirSync(dir).filter((f) => f.startsWith(prefixName)).sort();
-      let embeddedKept = 0, embeddedSkippedType = 0, embeddedSkippedDupe = 0, embeddedSkippedSmall = 0;
+      let embeddedKept = 0, embeddedSkippedType = 0, embeddedSkippedDupe = 0, embeddedSkippedSmall = 0, embeddedSkippedFlat = 0;
       for (const file of extractedFiles) {
         const ext = path.extname(file).toLowerCase();
         if (SKIP_EXTENSIONS.has(ext)) { embeddedSkippedType++; continue; }
@@ -270,6 +312,15 @@ async function saveFetchedContent(buf, contentType, workDir, label, archive, see
           continue;
         }
 
+        // Filter out large-but-flat graphics (logos, banners, solid bars) that pass the size
+        // check above but still aren't real photo content — real photos have far more
+        // distinct colors than a flat-colored logo or icon, however big it's rendered.
+        const distinctColors = await countDistinctColors(fileBuf, ext);
+        if (distinctColors !== null && distinctColors < MIN_DISTINCT_COLORS) {
+          embeddedSkippedFlat++;
+          continue;
+        }
+
         const hash = hashBuffer(fileBuf);
         if (seenHashes.has(hash)) { embeddedSkippedDupe++; continue; }
         seenHashes.add(hash);
@@ -278,6 +329,7 @@ async function saveFetchedContent(buf, contentType, workDir, label, archive, see
       }
       if (embeddedSkippedType) log(job, `Skipped ${embeddedSkippedType} embedded .svg/.webp image(s) in "${label}".`);
       if (embeddedSkippedSmall) log(job, `Skipped ${embeddedSkippedSmall} small embedded image(s) in "${label}" (likely icons/logos, under ${MIN_EMBEDDED_IMAGE_DIMENSION}px).`);
+      if (embeddedSkippedFlat) log(job, `Skipped ${embeddedSkippedFlat} flat-color embedded image(s) in "${label}" (likely logos/banners).`);
       if (embeddedSkippedDupe) log(job, `Skipped ${embeddedSkippedDupe} duplicate embedded image(s) in "${label}".`);
       log(job, `Extracted ${embeddedKept} embedded image(s) from PDF "${label}" (in addition to ${kept} page render(s)).`);
       kept += embeddedKept;
