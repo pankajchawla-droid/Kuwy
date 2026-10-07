@@ -166,6 +166,43 @@ const BROWSER_LIKE_HEADERS = {
 // Given an already-fetched buffer + its content-type, save it into the archive the right way
 // (folder-zip / single PDF / single image). Shared by the Nextcloud handler and the generic
 // direct-download handler so both link types get identical, tested handling.
+// Minimum pixel size (on the longer side) for an embedded PDF image to be treated as real
+// content (a photo) rather than template chrome (icons, logos, flat-color bars, QR codes).
+// Tune this up/down if real photos get filtered out or icons still slip through.
+const MIN_EMBEDDED_IMAGE_DIMENSION = 180;
+
+// Reads width/height straight from a PNG or JPEG file's own header bytes, without decoding
+// the image — fast, and avoids adding an image-processing dependency. Returns null if the
+// format isn't recognized or the header can't be parsed (caller should then keep the image
+// rather than risk dropping real content on a parsing miss).
+function readImageDimensions(buf) {
+  try {
+    // PNG: 8-byte signature, then an IHDR chunk whose data starts with width(4) + height(4).
+    if (buf.length > 24 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
+      return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+    }
+    // JPEG: scan markers for an SOFn segment, which holds height then width.
+    if (buf.length > 4 && buf[0] === 0xff && buf[1] === 0xd8) {
+      let pos = 2;
+      while (pos + 9 < buf.length) {
+        if (buf[pos] !== 0xff) { pos++; continue; }
+        const marker = buf[pos + 1];
+        if (marker === 0xd8 || marker === 0xd9) { pos += 2; continue; }
+        if (marker >= 0xd0 && marker <= 0xd7) { pos += 2; continue; }
+        const segLen = buf.readUInt16BE(pos + 2);
+        const isSOF = marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc;
+        if (isSOF) {
+          return { height: buf.readUInt16BE(pos + 5), width: buf.readUInt16BE(pos + 7) };
+        }
+        pos += 2 + segLen;
+      }
+    }
+  } catch {
+    // fall through to null below
+  }
+  return null;
+}
+
 async function saveFetchedContent(buf, contentType, workDir, label, archive, seenHashes, job) {
   if (contentType.includes("application/zip") || contentType.includes("application/octet-stream")) {
     const isZip = buf.length > 4 && buf[0] === 0x50 && buf[1] === 0x4b; // "PK" zip signature
@@ -218,12 +255,21 @@ async function saveFetchedContent(buf, contentType, workDir, label, archive, see
       const dir = path.dirname(extractPrefix);
       const prefixName = path.basename(extractPrefix);
       const extractedFiles = fs.readdirSync(dir).filter((f) => f.startsWith(prefixName)).sort();
-      let embeddedKept = 0, embeddedSkippedType = 0, embeddedSkippedDupe = 0;
+      let embeddedKept = 0, embeddedSkippedType = 0, embeddedSkippedDupe = 0, embeddedSkippedSmall = 0;
       for (const file of extractedFiles) {
         const ext = path.extname(file).toLowerCase();
         if (SKIP_EXTENSIONS.has(ext)) { embeddedSkippedType++; continue; }
         const filePath = path.join(dir, file);
         const fileBuf = fs.readFileSync(filePath);
+
+        // Filter out small template chrome (icons, logos, flat-color bars, QR codes) — real
+        // content photos are almost always much larger on at least one side.
+        const dims = readImageDimensions(fileBuf);
+        if (dims && Math.max(dims.width, dims.height) < MIN_EMBEDDED_IMAGE_DIMENSION) {
+          embeddedSkippedSmall++;
+          continue;
+        }
+
         const hash = hashBuffer(fileBuf);
         if (seenHashes.has(hash)) { embeddedSkippedDupe++; continue; }
         seenHashes.add(hash);
@@ -231,6 +277,7 @@ async function saveFetchedContent(buf, contentType, workDir, label, archive, see
         embeddedKept++;
       }
       if (embeddedSkippedType) log(job, `Skipped ${embeddedSkippedType} embedded .svg/.webp image(s) in "${label}".`);
+      if (embeddedSkippedSmall) log(job, `Skipped ${embeddedSkippedSmall} small embedded image(s) in "${label}" (likely icons/logos, under ${MIN_EMBEDDED_IMAGE_DIMENSION}px).`);
       if (embeddedSkippedDupe) log(job, `Skipped ${embeddedSkippedDupe} duplicate embedded image(s) in "${label}".`);
       log(job, `Extracted ${embeddedKept} embedded image(s) from PDF "${label}" (in addition to ${kept} page render(s)).`);
       kept += embeddedKept;
