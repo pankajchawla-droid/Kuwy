@@ -56,3 +56,11 @@ curl -X POST http://localhost:3000/bulk-download -H "Content-Type: application/j
 - Only point this at reports you're authorized to access; some sites' terms of service
   prohibit automated scraping even of your own purchased reports, so it's worth checking
   kuwycarcheck's terms before running this at scale.
+
+## Optional: arrange vehicle photos (front, left, right, back, other)
+
+For PDF reports, the photos pulled out of the PDF can be arranged by vehicle view. Add an
+environment variable `ANTHROPIC_API_KEY` to the Render service (Environment tab). Photos are then
+named like `img-01-front.jpg`, `img-02-left.jpg`, ... `img-09-other.jpg`. Without the key, photos
+stay in PDF order and keep the plain `img-1`, `img-2` names. Optional `ANTHROPIC_MODEL` overrides
+the model used for classifying.

@@ -246,6 +246,93 @@ async function countDistinctColors(buf, ext) {
   }
 }
 
+// ---------- optional: arrange vehicle photos front, left, right, back, other ----------
+// Needs an Anthropic API key in the ANTHROPIC_API_KEY environment variable. Each kept photo is
+// shrunk and sent to a Claude model, which names the view. Without the key nothing here runs.
+const VIEW_ORDER = ["front", "left", "right", "back", "other"];
+const ANTHROPIC_API_URL = process.env.ANTHROPIC_API_URL || "https://api.anthropic.com/v1/messages";
+const VIEW_PROMPT =
+  "This photo comes from a vehicle inspection report. Which view of the vehicle's exterior does it show? " +
+  "Answer with exactly one word: front, left, right, back, or other. " +
+  "Use other for anything that is not an exterior view of the whole vehicle (interior, dashboard, engine bay, " +
+  "tyre or wheel close-up, odometer, documents, labels, people). " +
+  "For a diagonal view, answer front or back when that end of the vehicle faces the camera, otherwise left or right. " +
+  "Left and right mean the vehicle's own left and right side.";
+
+async function prepareForClassification(buf, ext, workDir) {
+  const inPath = path.join(workDir, `cls-${uuid()}${ext}`);
+  const outPath = path.join(workDir, `cls-${uuid()}.jpg`);
+  try {
+    fs.writeFileSync(inPath, buf);
+    await execFileAsync("gm", ["convert", inPath, "-resize", "640x640>", "-quality", "70", outPath]);
+    return { data: fs.readFileSync(outPath), mediaType: "image/jpeg" };
+  } catch {
+    if (buf.length < 4 * 1024 * 1024 && [".jpg", ".jpeg", ".png"].includes(ext)) {
+      return { data: buf, mediaType: ext === ".png" ? "image/png" : "image/jpeg" };
+    }
+    return null;
+  }
+}
+
+async function classifyVehicleView(buf, ext, workDir) {
+  const img = await prepareForClassification(buf, ext, workDir);
+  if (!img) return "other";
+  const resp = await fetch(ANTHROPIC_API_URL, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": process.env.ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: process.env.ANTHROPIC_MODEL || "claude-haiku-5-5",
+      max_tokens: 10,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "image", source: { type: "base64", media_type: img.mediaType, data: img.data.toString("base64") } },
+            { type: "text", text: VIEW_PROMPT },
+          ],
+        },
+      ],
+    }),
+  });
+  if (!resp.ok) throw new Error(`classifier HTTP ${resp.status}`);
+  const data = await resp.json();
+  const text = ((data.content || []).find((c) => c.type === "text") || {}).text || "";
+  const word = text.toLowerCase().match(/front|left|right|back|rear|other/);
+  if (!word) return "other";
+  return word[0] === "rear" ? "back" : word[0];
+}
+
+// items: [{ buf, ext }] in PDF order. Returns them with a .view label, sorted front, left, right,
+// back, other; photos with the same view keep their original relative order.
+async function orderByVehicleView(items, workDir, job, label) {
+  const views = new Array(items.length);
+  let failed = 0;
+  let firstError = null;
+  let next = 0;
+  async function worker() {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      try {
+        views[i] = await classifyVehicleView(items[i].buf, items[i].ext, workDir);
+      } catch (err) {
+        views[i] = "other";
+        failed++;
+        firstError = firstError || err.message;
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(4, items.length) }, worker));
+  if (failed) log(job, `Could not classify ${failed} photo(s) in "${label}" (${firstError}); they were placed under other.`);
+  return items
+    .map((item, idx) => ({ ...item, view: views[idx], idx }))
+    .sort((a, b) => VIEW_ORDER.indexOf(a.view) - VIEW_ORDER.indexOf(b.view) || a.idx - b.idx);
+}
+
 async function saveFetchedContent(buf, contentType, workDir, label, archive, seenHashes, job) {
   if (contentType.includes("application/zip") || contentType.includes("application/octet-stream")) {
     const isZip = buf.length > 4 && buf[0] === 0x50 && buf[1] === 0x4b; // "PK" zip signature
@@ -298,6 +385,7 @@ async function saveFetchedContent(buf, contentType, workDir, label, archive, see
       const prefixName = path.basename(extractPrefix);
       const extractedFiles = fs.readdirSync(dir).filter((f) => f.startsWith(prefixName)).sort();
       let embeddedKept = 0, embeddedSkippedType = 0, embeddedSkippedDupe = 0, embeddedSkippedSmall = 0, embeddedSkippedFlat = 0;
+      const keptImages = [];
       for (const file of extractedFiles) {
         const ext = path.extname(file).toLowerCase();
         if (SKIP_EXTENSIONS.has(ext)) { embeddedSkippedType++; continue; }
@@ -324,9 +412,30 @@ async function saveFetchedContent(buf, contentType, workDir, label, archive, see
         const hash = hashBuffer(fileBuf);
         if (seenHashes.has(hash)) { embeddedSkippedDupe++; continue; }
         seenHashes.add(hash);
-        archive.append(fileBuf, { name: `${label}/img-${embeddedKept + 1}${ext}` });
+        keptImages.push({ buf: fileBuf, ext });
         embeddedKept++;
       }
+
+      // Write the kept photos into the zip. With ANTHROPIC_API_KEY set, they are arranged
+      // front, left, right, back, other; without it they stay in PDF order (original naming).
+      if (process.env.ANTHROPIC_API_KEY && keptImages.length > 1) {
+        const ordered = await orderByVehicleView(keptImages, workDir, job, label);
+        const width = Math.max(2, String(ordered.length).length);
+        ordered.forEach((item, n) => {
+          archive.append(item.buf, { name: `${label}/img-${String(n + 1).padStart(width, "0")}-${item.view}${item.ext}` });
+        });
+        const counts = VIEW_ORDER.map((v) => `${ordered.filter((o) => o.view === v).length} ${v}`).join(", ");
+        log(job, `Arranged photos in "${label}": ${counts}.`);
+      } else {
+        keptImages.forEach((item, n) => {
+          archive.append(item.buf, { name: `${label}/img-${n + 1}${item.ext}` });
+        });
+        if (keptImages.length > 1 && !job.orderNoteLogged) {
+          job.orderNoteLogged = true;
+          log(job, "Photos kept in PDF order. Set ANTHROPIC_API_KEY on the server to arrange them front, left, right, back.");
+        }
+      }
+
       if (embeddedSkippedType) log(job, `Skipped ${embeddedSkippedType} embedded .svg/.webp image(s) in "${label}".`);
       if (embeddedSkippedSmall) log(job, `Skipped ${embeddedSkippedSmall} small embedded image(s) in "${label}" (likely icons/logos, under ${MIN_EMBEDDED_IMAGE_DIMENSION}px).`);
       if (embeddedSkippedFlat) log(job, `Skipped ${embeddedSkippedFlat} flat-color embedded image(s) in "${label}" (likely logos/banners).`);
