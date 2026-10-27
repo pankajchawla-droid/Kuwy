@@ -274,18 +274,98 @@ async function prepareForClassification(buf, ext, workDir) {
   }
 }
 
+function orderingModel() {
+  return process.env.ANTHROPIC_MODEL || "claude-haiku-5-5";
+}
+
+// Which AI service arranges the photos: Claude if ANTHROPIC_API_KEY is set, otherwise Google
+// Gemini (which has a free tier) if GEMINI_API_KEY is set. null means ordering is off.
+function orderingProvider() {
+  if (process.env.ANTHROPIC_API_KEY) return "claude";
+  if (process.env.GEMINI_API_KEY) return "gemini";
+  return null;
+}
+
+function geminiModel() {
+  return process.env.GEMINI_MODEL || "gemini-2.5-flash";
+}
+
+// Posts JSON to an AI service. Retries rate-limit and server errors (waiting as the service asks),
+// and turns failures into readable messages (for example "credit balance is too low") so they
+// show up in the activity log instead of a bare status code.
+async function postJsonWithRetry(name, url, headers, body, attempts) {
+  let lastErr;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    let resp;
+    try {
+      resp = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...headers },
+        body: JSON.stringify(body),
+      });
+    } catch (err) {
+      lastErr = new Error(`could not reach ${name} (${err.message})`);
+      if (attempt === attempts - 1) throw lastErr;
+      await new Promise((r) => setTimeout(r, Math.min(20000, 1000 * 2 ** attempt)));
+      continue;
+    }
+    if (resp.ok) return resp.json();
+    let detail = "";
+    let bodyRetrySeconds = NaN;
+    try {
+      const j = await resp.json();
+      detail = (j.error && j.error.message) || "";
+      const info = ((j.error && j.error.details) || []).find((d) => d && d.retryDelay);
+      if (info) bodyRetrySeconds = parseFloat(info.retryDelay);
+    } catch {
+      // body was not JSON
+    }
+    lastErr = new Error(`${name} HTTP ${resp.status}${detail ? ": " + detail.slice(0, 160) : ""}`);
+    const retryable = resp.status === 429 || resp.status === 529 || resp.status >= 500;
+    if (!retryable || attempt === attempts - 1) throw lastErr;
+    const headerSeconds = Number(resp.headers.get("retry-after"));
+    const seconds = headerSeconds > 0 ? headerSeconds : bodyRetrySeconds > 0 ? bodyRetrySeconds : 2 ** attempt;
+    await new Promise((r) => setTimeout(r, Math.min(65000, seconds * 1000)));
+  }
+  throw lastErr;
+}
+
+async function callAnthropic(body, attempts = 4) {
+  return postJsonWithRetry(
+    "Claude API",
+    ANTHROPIC_API_URL,
+    { "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
+    body,
+    attempts
+  );
+}
+
+// parts: Gemini "parts" array (text and/or inline_data). Returns the reply text.
+async function callGemini(parts, attempts = 6) {
+  const base = process.env.GEMINI_API_URL || "https://generativelanguage.googleapis.com/v1beta";
+  const data = await postJsonWithRetry(
+    "Gemini API",
+    `${base}/models/${geminiModel()}:generateContent`,
+    { "x-goog-api-key": process.env.GEMINI_API_KEY },
+    { contents: [{ parts }], generationConfig: { temperature: 0, maxOutputTokens: 256 } },
+    attempts
+  );
+  const cand = (data.candidates || [])[0];
+  return ((cand && cand.content && cand.content.parts) || []).map((p) => p.text || "").join(" ");
+}
+
 async function classifyVehicleView(buf, ext, workDir) {
   const img = await prepareForClassification(buf, ext, workDir);
   if (!img) return "other";
-  const resp = await fetch(ANTHROPIC_API_URL, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-api-key": process.env.ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model: process.env.ANTHROPIC_MODEL || "claude-haiku-5-5",
+  let text;
+  if (orderingProvider() === "gemini") {
+    text = await callGemini([
+      { inline_data: { mime_type: img.mediaType, data: img.data.toString("base64") } },
+      { text: VIEW_PROMPT },
+    ]);
+  } else {
+    const data = await callAnthropic({
+      model: orderingModel(),
       max_tokens: 10,
       messages: [
         {
@@ -296,11 +376,9 @@ async function classifyVehicleView(buf, ext, workDir) {
           ],
         },
       ],
-    }),
-  });
-  if (!resp.ok) throw new Error(`classifier HTTP ${resp.status}`);
-  const data = await resp.json();
-  const text = ((data.content || []).find((c) => c.type === "text") || {}).text || "";
+    });
+    text = ((data.content || []).find((c) => c.type === "text") || {}).text || "";
+  }
   const word = text.toLowerCase().match(/front|left|right|back|rear|other/);
   if (!word) return "other";
   return word[0] === "rear" ? "back" : word[0];
@@ -326,7 +404,7 @@ async function orderByVehicleView(items, workDir, job, label) {
       }
     }
   }
-  await Promise.all(Array.from({ length: Math.min(4, items.length) }, worker));
+  await Promise.all(Array.from({ length: Math.min(orderingProvider() === "gemini" ? 2 : 4, items.length) }, worker));
   if (failed) log(job, `Could not classify ${failed} photo(s) in "${label}" (${firstError}); they were placed under other.`);
   return items
     .map((item, idx) => ({ ...item, view: views[idx], idx }))
@@ -416,9 +494,9 @@ async function saveFetchedContent(buf, contentType, workDir, label, archive, see
         embeddedKept++;
       }
 
-      // Write the kept photos into the zip. With ANTHROPIC_API_KEY set, they are arranged
+      // Write the kept photos into the zip. With an AI key set, they are arranged
       // front, left, right, back, other; without it they stay in PDF order (original naming).
-      if (process.env.ANTHROPIC_API_KEY && keptImages.length > 1) {
+      if (orderingProvider() && keptImages.length > 1) {
         const ordered = await orderByVehicleView(keptImages, workDir, job, label);
         const width = Math.max(2, String(ordered.length).length);
         ordered.forEach((item, n) => {
@@ -432,7 +510,7 @@ async function saveFetchedContent(buf, contentType, workDir, label, archive, see
         });
         if (keptImages.length > 1 && !job.orderNoteLogged) {
           job.orderNoteLogged = true;
-          log(job, "Photos kept in PDF order. Set ANTHROPIC_API_KEY on the server to arrange them front, left, right, back.");
+          log(job, "Photos kept in PDF order. Add ANTHROPIC_API_KEY (Claude) or GEMINI_API_KEY (Google, has a free tier) on the server to arrange them front, left, right, back.");
         }
       }
 
@@ -1171,11 +1249,33 @@ app.get("/sample-template.xlsx", (_req, res) => {
   res.send(buf);
 });
 
+app.get("/ordering-check", async (_req, res) => {
+  res.type("text/plain");
+  const provider = orderingProvider();
+  if (!provider) {
+    return res.send("Photo ordering is OFF: neither ANTHROPIC_API_KEY nor GEMINI_API_KEY is set on this server.");
+  }
+  try {
+    if (provider === "gemini") {
+      await callGemini([{ text: "Reply with the single word: ok" }], 3);
+      res.send(`Photo ordering is ON and working (Google Gemini, model: ${geminiModel()}).`);
+    } else {
+      await callAnthropic(
+        { model: orderingModel(), max_tokens: 5, messages: [{ role: "user", content: "Reply with the single word: ok" }] },
+        3
+      );
+      res.send(`Photo ordering is ON and working (Claude, model: ${orderingModel()}).`);
+    }
+  } catch (err) {
+    res.status(502).send(`Photo ordering is ON (${provider === "gemini" ? "Google Gemini" : "Claude"}) but the API call failed: ${err.message}`);
+  }
+});
+
 app.get("/", (_req, res) => {
-  const orderingOn = Boolean(process.env.ANTHROPIC_API_KEY);
+  const orderingOn = Boolean(orderingProvider());
   const status = orderingOn
-    ? "Photo ordering: ON"
-    : "Photo ordering: OFF (add ANTHROPIC_API_KEY in Render to arrange photos front, left, right, back)";
+    ? 'Photo ordering: ON <a href="/ordering-check" target="_blank" style="color:var(--orange);">(test)</a>'
+    : 'Photo ordering: OFF (add ANTHROPIC_API_KEY or GEMINI_API_KEY in Render) <a href="/ordering-check" target="_blank" style="color:var(--orange);">(test)</a>';
   res.send(HOMEPAGE_HTML.replace("<!--ORDER_STATUS-->", status));
 });
 

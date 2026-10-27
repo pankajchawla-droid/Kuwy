@@ -64,3 +64,10 @@ environment variable `ANTHROPIC_API_KEY` to the Render service (Environment tab)
 named like `img-01-front.jpg`, `img-02-left.jpg`, ... `img-09-other.jpg`. Without the key, photos
 stay in PDF order and keep the plain `img-1`, `img-2` names. Optional `ANTHROPIC_MODEL` overrides
 the model used for classifying.
+
+### Free option: Google Gemini
+
+Instead of `ANTHROPIC_API_KEY` you can set `GEMINI_API_KEY` (create one in Google AI Studio). Gemini has
+a free tier with rate limits, so large batches run slower, and free-tier content may be used by Google to
+improve its products. Optional `GEMINI_MODEL` changes the model (default `gemini-2.5-flash`). If both keys
+are set, Claude is used. Open `/ordering-check` on your site to test the key.
