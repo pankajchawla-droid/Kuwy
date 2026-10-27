@@ -1018,7 +1018,7 @@ https://.../admin/inspectionReports?id=...&type=..."></textarea>
     </div>
 
     <div class="foot">
-      <span class="hint" style="margin:0;">Runs entirely on your own Render service.</span>
+      <span class="hint" style="margin:0;">Runs entirely on your own Render service. <!--ORDER_STATUS--></span>
       <span class="made-by">Made by <b>PC</b></span>
     </div>
   </div>
@@ -1172,7 +1172,11 @@ app.get("/sample-template.xlsx", (_req, res) => {
 });
 
 app.get("/", (_req, res) => {
-  res.send(HOMEPAGE_HTML);
+  const orderingOn = Boolean(process.env.ANTHROPIC_API_KEY);
+  const status = orderingOn
+    ? "Photo ordering: ON"
+    : "Photo ordering: OFF (add ANTHROPIC_API_KEY in Render to arrange photos front, left, right, back)";
+  res.send(HOMEPAGE_HTML.replace("<!--ORDER_STATUS-->", status));
 });
 
 const PORT = process.env.PORT || 3000;
