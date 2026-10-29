@@ -386,7 +386,7 @@ async function classifyVehicleView(buf, ext, workDir) {
 
 // items: [{ buf, ext }] in PDF order. Returns them with a .view label, sorted front, left, right,
 // back, other; photos with the same view keep their original relative order.
-async function orderByVehicleView(items, workDir, job, label) {
+async function orderByVehicleView(items, workDir, job, label, preclassify) {
   const views = new Array(items.length);
   let failed = 0;
   let firstError = null;
@@ -396,7 +396,8 @@ async function orderByVehicleView(items, workDir, job, label) {
       const i = next++;
       if (i >= items.length) return;
       try {
-        views[i] = await classifyVehicleView(items[i].buf, items[i].ext, workDir);
+        const known = preclassify ? await preclassify(items[i]) : null;
+        views[i] = known || (await classifyVehicleView(items[i].buf, items[i].ext, workDir));
       } catch (err) {
         views[i] = "other";
         failed++;
@@ -409,6 +410,73 @@ async function orderByVehicleView(items, workDir, job, label) {
   return items
     .map((item, idx) => ({ ...item, view: views[idx], idx }))
     .sort((a, b) => VIEW_ORDER.indexOf(a.view) - VIEW_ORDER.indexOf(b.view) || a.idx - b.idx);
+}
+
+// Filename-first guess: if a photo's own file name says what it shows (front, rear, left, interior...),
+// use that and skip the AI call. Returns a view, or null when the name says nothing useful.
+function viewFromFilename(fileName) {
+  const tokens = new Set(
+    path.basename(fileName, path.extname(fileName)).toLowerCase().split(/[^a-z]+/).filter(Boolean)
+  );
+  const has = (...words) => words.some((w) => tokens.has(w));
+  if (has("interior", "dashboard", "dash", "engine", "bay", "tyre", "tire", "wheel", "odometer", "meter", "seat", "boot", "trunk", "chassis", "vin", "rc", "document", "doc")) return "other";
+  if (has("front", "frnt", "fr")) return "front";
+  if (has("rear", "back")) return "back";
+  if (has("left", "lhs")) return "left";
+  if (has("right", "rhs")) return "right";
+  return null;
+}
+
+const ORDERED_NAME = /\/img-\d+-(front|left|right|back|other)\./;
+const PHOTO_EXTS = new Set([".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff"]);
+
+// Wraps the zip so that any photo a link handler adds gets arranged front, left, right, back, other
+// once the handler is done. Everything else (page renders, PDFs, error notes, photos the PDF path
+// already arranged) goes straight through. Only used when an AI key is set; otherwise handlers get
+// the real zip and behave exactly as before.
+function makeOrderingArchive(real, workDir, label, job) {
+  const pending = [];
+  return {
+    append(data, opts) {
+      const name = (opts && opts.name) || "";
+      const ext = path.extname(name).toLowerCase();
+      const isPhoto = Buffer.isBuffer(data) && PHOTO_EXTS.has(ext);
+      if (isPhoto && !ORDERED_NAME.test(name) && !/\/(page-|report-page-)/.test(name)) {
+        pending.push({ buf: data, ext, name });
+        return;
+      }
+      return real.append(data, opts);
+    },
+    async flush() {
+      if (pending.length === 0) return;
+      if (pending.length === 1) {
+        real.append(pending[0].buf, { name: pending[0].name });
+        return;
+      }
+      let ordered;
+      try {
+        ordered = await orderByVehicleView(pending, workDir, job, label, async (item) => {
+          const byName = viewFromFilename(path.basename(item.name));
+          if (byName) return byName;
+          const dims = readImageDimensions(item.buf);
+          if (dims && Math.max(dims.width, dims.height) < MIN_EMBEDDED_IMAGE_DIMENSION) return "other";
+          const colors = await countDistinctColors(item.buf, item.ext);
+          if (colors !== null && colors < MIN_DISTINCT_COLORS) return "other";
+          return null;
+        });
+      } catch (err) {
+        log(job, `Could not arrange photos in "${label}": ${err.message}`);
+        pending.forEach((it) => real.append(it.buf, { name: it.name }));
+        return;
+      }
+      const width = Math.max(2, String(ordered.length).length);
+      ordered.forEach((it, n) => {
+        real.append(it.buf, { name: `${label}/img-${String(n + 1).padStart(width, "0")}-${it.view}${it.ext}` });
+      });
+      const counts = VIEW_ORDER.map((v) => `${ordered.filter((o) => o.view === v).length} ${v}`).join(", ");
+      log(job, `Arranged photos in "${label}": ${counts}.`);
+    },
+  };
 }
 
 async function saveFetchedContent(buf, contentType, workDir, label, archive, seenHashes, job) {
@@ -796,23 +864,31 @@ async function runJob(jobId, entries, cookie) {
       const url = String(entry.url).trim();
       job.current = i + 1;
       log(job, `Fetching "${label}"...`);
+      const entryArchive = orderingProvider() ? makeOrderingArchive(archive, workDir, label, job) : archive;
       try {
         if (isNextcloudShare(url)) {
-          await handleNextcloudShare(url, reqHeaders, workDir, label, archive, seenHashes, job);
+          await handleNextcloudShare(url, reqHeaders, workDir, label, entryArchive, seenHashes, job);
         } else if (url.toLowerCase().includes(".pdf")) {
-          await handlePdf(url, reqHeaders, workDir, label, archive, seenHashes, job);
+          await handlePdf(url, reqHeaders, workDir, label, entryArchive, seenHashes, job);
         } else if (isDirectDownloadLink(url)) {
-          await handleGenericDownload(url, reqHeaders, workDir, label, archive, seenHashes, job);
+          await handleGenericDownload(url, reqHeaders, workDir, label, entryArchive, seenHashes, job);
         } else if (isReportActionLink(url)) {
-          await handleSmartReport(url, reqHeaders, workDir, label, archive, seenHashes, job, ensureBrowser);
+          await handleSmartReport(url, reqHeaders, workDir, label, entryArchive, seenHashes, job, ensureBrowser);
         } else {
           const br = await ensureBrowser();
-          await handleHtmlPage(url, reqHeaders, br, label, archive, seenHashes, job);
+          await handleHtmlPage(url, reqHeaders, br, label, entryArchive, seenHashes, job);
         }
         log(job, `Done: "${label}"`);
       } catch (err) {
         log(job, `Failed "${label}": ${err.message}`);
         archive.append(`Failed to fetch ${url}: ${err.message}`, { name: `${label}-ERROR.txt` });
+      }
+      if (entryArchive !== archive) {
+        try {
+          await entryArchive.flush();
+        } catch (err) {
+          log(job, `Could not arrange photos in "${label}": ${err.message}`);
+        }
       }
     }
   } finally {
@@ -1253,7 +1329,7 @@ app.get("/ordering-check", async (_req, res) => {
   res.type("text/plain");
   const provider = orderingProvider();
   if (!provider) {
-    return res.send("Photo ordering is OFF: neither ANTHROPIC_API_KEY nor GEMINI_API_KEY is set on this server.");
+    return res.send("Photo ordering is OFF: neither ANTHROPIC_API_KEY nor GEMINI_API_KEY is set on this server.\n\nTo turn it on (free): get a key in Google AI Studio (aistudio.google.com), then in Render open your service > Environment > Add Environment Variable, name GEMINI_API_KEY, paste the key as the value, and save. Reload this page afterwards.");
   }
   try {
     if (provider === "gemini") {

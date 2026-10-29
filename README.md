@@ -71,3 +71,10 @@ Instead of `ANTHROPIC_API_KEY` you can set `GEMINI_API_KEY` (create one in Googl
 a free tier with rate limits, so large batches run slower, and free-tier content may be used by Google to
 improve its products. Optional `GEMINI_MODEL` changes the model (default `gemini-2.5-flash`). If both keys
 are set, Claude is used. Open `/ordering-check` on your site to test the key.
+
+### Where ordering applies
+
+With an AI key set, photos are arranged for every link type that produces photos (photos inside PDFs,
+shared photo folders/zips, single images, and images found on report pages). Photos whose file name
+already says what they show (front, rear, left, right, interior...) are placed by name without an AI
+call, and tiny or flat graphics go to "other". Page renders and PDFs are never reordered.
