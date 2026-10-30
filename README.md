@@ -69,7 +69,7 @@ the model used for classifying.
 
 Instead of `ANTHROPIC_API_KEY` you can set `GEMINI_API_KEY` (create one in Google AI Studio). Gemini has
 a free tier with rate limits, so large batches run slower, and free-tier content may be used by Google to
-improve its products. Optional `GEMINI_MODEL` changes the model (default `gemini-2.5-flash`). If both keys
+improve its products. The tool asks Google for the newest `-flash` model by itself (Google retires old names), so no model setting is needed; optional `GEMINI_MODEL` forces a specific one. If both keys
 are set, Claude is used. Open `/ordering-check` on your site to test the key.
 
 ### Where ordering applies
@@ -78,3 +78,9 @@ With an AI key set, photos are arranged for every link type that produces photos
 shared photo folders/zips, single images, and images found on report pages). Photos whose file name
 already says what they show (front, rear, left, right, interior...) are placed by name without an AI
 call, and tiny or flat graphics go to "other". Page renders and PDFs are never reordered.
+
+### Paste the key on the page instead of in Render
+
+The tool page has a "Photo ordering key" box at the top. A key pasted there (a Gemini key, or a Claude key
+starting `sk-ant-`) is saved only in that browser and sent only when a job starts. The server does not store
+it. The "Test key" link next to the box checks it. Keys set in Render's Environment tab still work.

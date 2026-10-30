@@ -280,14 +280,73 @@ function orderingModel() {
 
 // Which AI service arranges the photos: Claude if ANTHROPIC_API_KEY is set, otherwise Google
 // Gemini (which has a free tier) if GEMINI_API_KEY is set. null means ordering is off.
-function orderingProvider() {
-  if (process.env.ANTHROPIC_API_KEY) return "claude";
-  if (process.env.GEMINI_API_KEY) return "gemini";
+function envAiConfig() {
+  if (process.env.ANTHROPIC_API_KEY) return { provider: "claude", key: process.env.ANTHROPIC_API_KEY };
+  if (process.env.GEMINI_API_KEY) return { provider: "gemini", key: process.env.GEMINI_API_KEY };
   return null;
 }
 
-function geminiModel() {
-  return process.env.GEMINI_MODEL || "gemini-2.5-flash";
+function orderingProvider() {
+  const c = envAiConfig();
+  return c ? c.provider : null;
+}
+
+// A key pasted into the page: sk-ant-... is a Claude key, anything else is treated as a Gemini key.
+function aiConfigFromKey(rawKey) {
+  const key = typeof rawKey === "string" ? rawKey.trim() : "";
+  if (key.length < 20 || key.length > 300 || /\s/.test(key)) return null;
+  return { provider: key.startsWith("sk-ant-") ? "claude" : "gemini", key };
+}
+
+// The AI settings a job uses: the key pasted for that job, else the server-wide keys.
+function aiConfigFor(job) {
+  return (job && job.ai) || envAiConfig();
+}
+
+// Google retires Gemini model names over time, so the model is looked up from Google's own model
+// list (newest plain "-flash" model that can generate content) instead of being hard-coded. Set
+// GEMINI_MODEL to force a specific one. If the list can't be read, the fallback below is used.
+const GEMINI_FALLBACK_MODEL = "gemini-3.8-flash";
+const geminiModelCache = new Map(); // api key -> model name
+
+function geminiBase() {
+  return process.env.GEMINI_API_URL || "https://generativelanguage.googleapis.com/v1beta";
+}
+
+function pickGeminiModel(models) {
+  const usable = (models || []).filter(
+    (m) => !m.supportedGenerationMethods || m.supportedGenerationMethods.includes("generateContent")
+  );
+  for (const pattern of [/^gemini-(\d+(?:\.\d+)?)-flash$/, /^gemini-(\d+(?:\.\d+)?)-flash-lite$/]) {
+    const found = usable
+      .map((m) => {
+        const name = String(m.name || "").replace(/^models\//, "");
+        const mm = name.match(pattern);
+        return mm ? { name, version: parseFloat(mm[1]) } : null;
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.version - a.version);
+    if (found.length) return found[0].name;
+  }
+  return null;
+}
+
+async function resolveGeminiModel(key, forceRefresh = false) {
+  if (process.env.GEMINI_MODEL) return process.env.GEMINI_MODEL;
+  if (!forceRefresh && geminiModelCache.has(key)) return geminiModelCache.get(key);
+  try {
+    const resp = await fetch(`${geminiBase()}/models?pageSize=200`, { headers: { "x-goog-api-key": key } });
+    if (resp.ok) {
+      const best = pickGeminiModel((await resp.json()).models);
+      if (best) {
+        geminiModelCache.set(key, best);
+        return best;
+      }
+    }
+  } catch {
+    // fall through to the cached or fallback model
+  }
+  return geminiModelCache.get(key) || GEMINI_FALLBACK_MODEL;
 }
 
 // Posts JSON to an AI service. Retries rate-limit and server errors (waiting as the service asks),
@@ -330,39 +389,51 @@ async function postJsonWithRetry(name, url, headers, body, attempts) {
   throw lastErr;
 }
 
-async function callAnthropic(body, attempts = 4) {
+async function callAnthropic(body, attempts = 4, key = process.env.ANTHROPIC_API_KEY) {
   return postJsonWithRetry(
     "Claude API",
     ANTHROPIC_API_URL,
-    { "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
+    { "x-api-key": key, "anthropic-version": "2023-06-01" },
     body,
     attempts
   );
 }
 
 // parts: Gemini "parts" array (text and/or inline_data). Returns the reply text.
-async function callGemini(parts, attempts = 6) {
-  const base = process.env.GEMINI_API_URL || "https://generativelanguage.googleapis.com/v1beta";
-  const data = await postJsonWithRetry(
-    "Gemini API",
-    `${base}/models/${geminiModel()}:generateContent`,
-    { "x-goog-api-key": process.env.GEMINI_API_KEY },
-    { contents: [{ parts }], generationConfig: { temperature: 0, maxOutputTokens: 256 } },
-    attempts
-  );
-  const cand = (data.candidates || [])[0];
-  return ((cand && cand.content && cand.content.parts) || []).map((p) => p.text || "").join(" ");
+async function callGemini(parts, attempts = 6, key = process.env.GEMINI_API_KEY) {
+  async function generate(model) {
+    const data = await postJsonWithRetry(
+      "Gemini API",
+      `${geminiBase()}/models/${model}:generateContent`,
+      { "x-goog-api-key": key },
+      { contents: [{ parts }], generationConfig: { temperature: 0, maxOutputTokens: 256 } },
+      attempts
+    );
+    const cand = (data.candidates || [])[0];
+    return ((cand && cand.content && cand.content.parts) || []).map((p) => p.text || "").join(" ");
+  }
+  const model = await resolveGeminiModel(key);
+  try {
+    return await generate(model);
+  } catch (err) {
+    // A 404 usually means Google retired this model name: look the model up again and retry once.
+    if (/HTTP 404/.test(err.message) && !process.env.GEMINI_MODEL) {
+      const fresh = await resolveGeminiModel(key, true);
+      if (fresh !== model) return generate(fresh);
+    }
+    throw err;
+  }
 }
 
-async function classifyVehicleView(buf, ext, workDir) {
+async function classifyVehicleView(buf, ext, workDir, ai) {
   const img = await prepareForClassification(buf, ext, workDir);
   if (!img) return "other";
   let text;
-  if (orderingProvider() === "gemini") {
+  if (ai.provider === "gemini") {
     text = await callGemini([
       { inline_data: { mime_type: img.mediaType, data: img.data.toString("base64") } },
       { text: VIEW_PROMPT },
-    ]);
+    ], 6, ai.key);
   } else {
     const data = await callAnthropic({
       model: orderingModel(),
@@ -376,7 +447,7 @@ async function classifyVehicleView(buf, ext, workDir) {
           ],
         },
       ],
-    });
+    }, 4, ai.key);
     text = ((data.content || []).find((c) => c.type === "text") || {}).text || "";
   }
   const word = text.toLowerCase().match(/front|left|right|back|rear|other/);
@@ -387,6 +458,7 @@ async function classifyVehicleView(buf, ext, workDir) {
 // items: [{ buf, ext }] in PDF order. Returns them with a .view label, sorted front, left, right,
 // back, other; photos with the same view keep their original relative order.
 async function orderByVehicleView(items, workDir, job, label, preclassify) {
+  const ai = aiConfigFor(job);
   const views = new Array(items.length);
   let failed = 0;
   let firstError = null;
@@ -397,7 +469,7 @@ async function orderByVehicleView(items, workDir, job, label, preclassify) {
       if (i >= items.length) return;
       try {
         const known = preclassify ? await preclassify(items[i]) : null;
-        views[i] = known || (await classifyVehicleView(items[i].buf, items[i].ext, workDir));
+        views[i] = known || (await classifyVehicleView(items[i].buf, items[i].ext, workDir, ai));
       } catch (err) {
         views[i] = "other";
         failed++;
@@ -405,7 +477,7 @@ async function orderByVehicleView(items, workDir, job, label, preclassify) {
       }
     }
   }
-  await Promise.all(Array.from({ length: Math.min(orderingProvider() === "gemini" ? 2 : 4, items.length) }, worker));
+  await Promise.all(Array.from({ length: Math.min(ai.provider === "gemini" ? 2 : 4, items.length) }, worker));
   if (failed) log(job, `Could not classify ${failed} photo(s) in "${label}" (${firstError}); they were placed under other.`);
   return items
     .map((item, idx) => ({ ...item, view: views[idx], idx }))
@@ -564,7 +636,7 @@ async function saveFetchedContent(buf, contentType, workDir, label, archive, see
 
       // Write the kept photos into the zip. With an AI key set, they are arranged
       // front, left, right, back, other; without it they stay in PDF order (original naming).
-      if (orderingProvider() && keptImages.length > 1) {
+      if (aiConfigFor(job) && keptImages.length > 1) {
         const ordered = await orderByVehicleView(keptImages, workDir, job, label);
         const width = Math.max(2, String(ordered.length).length);
         ordered.forEach((item, n) => {
@@ -864,7 +936,7 @@ async function runJob(jobId, entries, cookie) {
       const url = String(entry.url).trim();
       job.current = i + 1;
       log(job, `Fetching "${label}"...`);
-      const entryArchive = orderingProvider() ? makeOrderingArchive(archive, workDir, label, job) : archive;
+      const entryArchive = aiConfigFor(job) ? makeOrderingArchive(archive, workDir, label, job) : archive;
       try {
         if (isNextcloudShare(url)) {
           await handleNextcloudShare(url, reqHeaders, workDir, label, entryArchive, seenHashes, job);
@@ -899,6 +971,7 @@ async function runJob(jobId, entries, cookie) {
   }
 
   job.status = "done";
+  job.ai = null; // the pasted key is not kept after the job
   log(job, "All tasks completed.");
 }
 
@@ -919,6 +992,7 @@ function startJob(entries) {
 app.post("/jobs/from-excel", upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "Upload an .xlsx file under field name 'file'." });
   const cookie = (req.body && req.body.cookie) || "";
+  const aiKey = req.body && req.body.aiKey;
 
   let rows;
   try {
@@ -942,10 +1016,12 @@ app.post("/jobs/from-excel", upload.single("file"), async (req, res) => {
   }
 
   const jobId = startJob(entries);
+  jobs.get(jobId).ai = aiConfigFromKey(aiKey);
   runJob(jobId, entries, cookie).catch((err) => {
     const job = jobs.get(jobId);
     if (job) {
       job.status = "error";
+      job.ai = null;
       job.error = err.message;
       log(job, `Job failed: ${err.message}`);
     }
@@ -954,16 +1030,18 @@ app.post("/jobs/from-excel", upload.single("file"), async (req, res) => {
 });
 
 app.post("/jobs/from-urls", async (req, res) => {
-  const { urls, cookie } = req.body || {};
+  const { urls, cookie, aiKey } = req.body || {};
   if (!Array.isArray(urls) || urls.length === 0) {
     return res.status(400).json({ error: "Provide 'urls' as a non-empty array." });
   }
   const entries = urls.map((u, i) => ({ folder: `item-${i + 1}`, url: String(u || "").trim() }));
   const jobId = startJob(entries);
+  jobs.get(jobId).ai = aiConfigFromKey(aiKey);
   runJob(jobId, entries, cookie || "").catch((err) => {
     const job = jobs.get(jobId);
     if (job) {
       job.status = "error";
+      job.ai = null;
       job.error = err.message;
       log(job, `Job failed: ${err.message}`);
     }
@@ -1112,6 +1190,12 @@ const HOMEPAGE_HTML = `<!DOCTYPE html>
     </div>
 
     <div class="body">
+      <div class="field" style="margin-bottom:18px;">
+        <label>Photo ordering key (optional)</label>
+        <input type="password" id="aiKey" placeholder="Paste a free Gemini key to arrange photos front, left, right, back" autocomplete="off" />
+        <p class="hint">Stays in this browser and is sent only when you start a job. <a href="https://aistudio.google.com/apikey" target="_blank" style="color:var(--orange);">Get a free key</a> &middot; <a href="#" id="testKey" style="color:var(--orange);">Test key</a> <span id="keyStatus"></span></p>
+      </div>
+
       <div class="tabs">
         <button class="tab active" id="tabExcel">Excel Sheet</button>
         <button class="tab" id="tabPaste">Paste URLs</button>
@@ -1273,6 +1357,8 @@ https://.../admin/inspectionReports?id=...&type=..."></textarea>
     formData.append('file', xlsxFile.files[0]);
     const cookie = document.getElementById('cookieExcel').value.trim();
     if (cookie) formData.append('cookie', cookie);
+    var aiKeyValue = getAiKey();
+    if (aiKeyValue) formData.append('aiKey', aiKeyValue);
     try {
       const resp = await fetch('/jobs/from-excel', { method:'POST', body: formData });
       const data = await resp.json();
@@ -1293,7 +1379,7 @@ https://.../admin/inspectionReports?id=...&type=..."></textarea>
     try {
       const resp = await fetch('/jobs/from-urls', {
         method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ urls, cookie: cookie || undefined })
+        body: JSON.stringify({ urls: urls, cookie: cookie || undefined, aiKey: getAiKey() || undefined })
       });
       const data = await resp.json();
       if (!resp.ok) throw new Error(data.error || 'Failed to start job');
@@ -1303,6 +1389,22 @@ https://.../admin/inspectionReports?id=...&type=..."></textarea>
       document.getElementById('goPaste').disabled = false;
     }
   };
+
+  var aiKeyInput = document.getElementById('aiKey');
+  try { aiKeyInput.value = localStorage.getItem('kuwy_ai_key') || ''; } catch (e) {}
+  aiKeyInput.addEventListener('input', function () {
+    try { localStorage.setItem('kuwy_ai_key', aiKeyInput.value.trim()); } catch (e) {}
+  });
+  function getAiKey() { return aiKeyInput.value.trim(); }
+  document.getElementById('testKey').addEventListener('click', function (ev) {
+    ev.preventDefault();
+    var statusEl = document.getElementById('keyStatus');
+    statusEl.textContent = ' checking...';
+    fetch('/ordering-check', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ aiKey: getAiKey() }) })
+      .then(function (r) { return r.text(); })
+      .then(function (t) { statusEl.textContent = ' ' + t; })
+      .catch(function (e) { statusEl.textContent = ' Could not reach the server: ' + e.message; });
+  });
 
   resetBtn.onclick = resetUI;
 </script>
@@ -1325,33 +1427,50 @@ app.get("/sample-template.xlsx", (_req, res) => {
   res.send(buf);
 });
 
-app.get("/ordering-check", async (_req, res) => {
+async function checkAi(ai) {
+  if (ai.provider === "gemini") {
+    await callGemini([{ text: "Reply with the single word: ok" }], 3, ai.key);
+    return `Photo ordering is ON and working (Google Gemini, model: ${await resolveGeminiModel(ai.key)}).`;
+  }
+  await callAnthropic(
+    { model: orderingModel(), max_tokens: 5, messages: [{ role: "user", content: "Reply with the single word: ok" }] },
+    3,
+    ai.key
+  );
+  return `Photo ordering is ON and working (Claude, model: ${orderingModel()}).`;
+}
+
+async function respondToCheck(res, ai, offMessage) {
   res.type("text/plain");
-  const provider = orderingProvider();
-  if (!provider) {
-    return res.send("Photo ordering is OFF: neither ANTHROPIC_API_KEY nor GEMINI_API_KEY is set on this server.\n\nTo turn it on (free): get a key in Google AI Studio (aistudio.google.com), then in Render open your service > Environment > Add Environment Variable, name GEMINI_API_KEY, paste the key as the value, and save. Reload this page afterwards.");
-  }
+  if (!ai) return res.send(offMessage);
   try {
-    if (provider === "gemini") {
-      await callGemini([{ text: "Reply with the single word: ok" }], 3);
-      res.send(`Photo ordering is ON and working (Google Gemini, model: ${geminiModel()}).`);
-    } else {
-      await callAnthropic(
-        { model: orderingModel(), max_tokens: 5, messages: [{ role: "user", content: "Reply with the single word: ok" }] },
-        3
-      );
-      res.send(`Photo ordering is ON and working (Claude, model: ${orderingModel()}).`);
-    }
+    res.send(await checkAi(ai));
   } catch (err) {
-    res.status(502).send(`Photo ordering is ON (${provider === "gemini" ? "Google Gemini" : "Claude"}) but the API call failed: ${err.message}`);
+    res.status(502).send(`Photo ordering key found (${ai.provider === "gemini" ? "Google Gemini" : "Claude"}) but the API call failed: ${err.message}`);
   }
-});
+}
+
+app.get("/ordering-check", (_req, res) =>
+  respondToCheck(
+    res,
+    envAiConfig(),
+    "Photo ordering is OFF on the server: neither ANTHROPIC_API_KEY nor GEMINI_API_KEY is set.\n\nEasiest fix: paste a free Gemini key into the box at the top of the tool page (get one at aistudio.google.com). Or set GEMINI_API_KEY under your service's Environment tab in Render."
+  )
+);
+
+app.post("/ordering-check", (req, res) =>
+  respondToCheck(
+    res,
+    aiConfigFromKey(req.body && req.body.aiKey) || envAiConfig(),
+    "No key to test: paste a key into the box first (a free Gemini key from aistudio.google.com works)."
+  )
+);
 
 app.get("/", (_req, res) => {
   const orderingOn = Boolean(orderingProvider());
   const status = orderingOn
     ? 'Photo ordering: ON <a href="/ordering-check" target="_blank" style="color:var(--orange);">(test)</a>'
-    : 'Photo ordering: OFF (add ANTHROPIC_API_KEY or GEMINI_API_KEY in Render) <a href="/ordering-check" target="_blank" style="color:var(--orange);">(test)</a>';
+    : 'Photo ordering: OFF on the server (paste a key above, or set GEMINI_API_KEY in Render) <a href="/ordering-check" target="_blank" style="color:var(--orange);">(test)</a>';
   res.send(HOMEPAGE_HTML.replace("<!--ORDER_STATUS-->", status));
 });
 
