@@ -251,20 +251,27 @@ async function countDistinctColors(buf, ext) {
 // shrunk and sent to a Claude model, which names the view. Without the key nothing here runs.
 const VIEW_ORDER = ["front", "left", "right", "back", "other"];
 const ANTHROPIC_API_URL = process.env.ANTHROPIC_API_URL || "https://api.anthropic.com/v1/messages";
-const VIEW_PROMPT =
-  "This photo comes from a vehicle inspection report. Which view of the vehicle's exterior does it show? " +
-  "Answer with exactly one word: front, left, right, back, or other. " +
+const VIEW_RULES =
+  "Say which view of the vehicle's exterior each photo shows: front, left, right, back, or other. " +
   "Use other for anything that is not an exterior view of the whole vehicle (interior, dashboard, engine bay, " +
   "tyre or wheel close-up, odometer, documents, labels, people). " +
   "For a diagonal view, answer front or back when that end of the vehicle faces the camera, otherwise left or right. " +
   "Left and right mean the vehicle's own left and right side.";
+
+function batchPrompt(n) {
+  return (
+    `These ${n} photo${n === 1 ? " comes" : "s come"} from a vehicle inspection report, labelled Image 1` +
+    `${n > 1 ? " to Image " + n : ""}. ${VIEW_RULES} Answer with exactly ${n} line${n === 1 ? "" : "s"}, ` +
+    `one per image, written like "1: front" or "2: other", and nothing else.`
+  );
+}
 
 async function prepareForClassification(buf, ext, workDir) {
   const inPath = path.join(workDir, `cls-${uuid()}${ext}`);
   const outPath = path.join(workDir, `cls-${uuid()}.jpg`);
   try {
     fs.writeFileSync(inPath, buf);
-    await execFileAsync("gm", ["convert", inPath, "-resize", "640x640>", "-quality", "70", outPath]);
+    await execFileAsync("gm", ["convert", inPath, "-resize", "512x512>", "-quality", "70", outPath]);
     return { data: fs.readFileSync(outPath), mediaType: "image/jpeg" };
   } catch {
     if (buf.length < 4 * 1024 * 1024 && [".jpg", ".jpeg", ".png"].includes(ext)) {
@@ -335,7 +342,7 @@ async function resolveGeminiModel(key, forceRefresh = false) {
   if (process.env.GEMINI_MODEL) return process.env.GEMINI_MODEL;
   if (!forceRefresh && geminiModelCache.has(key)) return geminiModelCache.get(key);
   try {
-    const resp = await fetch(`${geminiBase()}/models?pageSize=200`, { headers: { "x-goog-api-key": key } });
+    const resp = await fetch(`${geminiBase()}/models?pageSize=200`, { headers: { "x-goog-api-key": key }, signal: AbortSignal.timeout(15000) });
     if (resp.ok) {
       const best = pickGeminiModel((await resp.json()).models);
       if (best) {
@@ -349,11 +356,17 @@ async function resolveGeminiModel(key, forceRefresh = false) {
   return geminiModelCache.get(key) || GEMINI_FALLBACK_MODEL;
 }
 
-// Posts JSON to an AI service. Retries rate-limit and server errors (waiting as the service asks),
-// and turns failures into readable messages (for example "credit balance is too low") so they
-// show up in the activity log instead of a bare status code.
-async function postJsonWithRetry(name, url, headers, body, attempts) {
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const AI_TIMEOUT_MS = Number(process.env.AI_TIMEOUT_MS) || 60000; // one request to the AI service
+const ORDERING_BUDGET_MS = Number(process.env.ORDERING_BUDGET_MS) || 150000; // arranging one report's photos
+const BATCH_SIZE = 6; // photos per AI request, so a free key's few-requests-a-minute limit is enough
+
+// Posts JSON to an AI service. Every attempt has a time limit. Rate-limit and server errors are retried
+// (waiting as the service asks, at most about 90 seconds in total). A daily-limit error is not retried,
+// because waiting cannot fix it. Failures become readable messages for the activity log.
+async function postJsonWithRetry(name, url, headers, body, attempts, note) {
   let lastErr;
+  let waitedMs = 0;
   for (let attempt = 0; attempt < attempts; attempt++) {
     let resp;
     try {
@@ -361,53 +374,66 @@ async function postJsonWithRetry(name, url, headers, body, attempts) {
         method: "POST",
         headers: { "content-type": "application/json", ...headers },
         body: JSON.stringify(body),
+        signal: AbortSignal.timeout(AI_TIMEOUT_MS),
       });
     } catch (err) {
-      lastErr = new Error(`could not reach ${name} (${err.message})`);
+      const timedOut = err && (err.name === "AbortError" || err.name === "TimeoutError");
+      lastErr = new Error(`could not reach ${name} (${timedOut ? "no answer in time" : err.message})`);
       if (attempt === attempts - 1) throw lastErr;
-      await new Promise((r) => setTimeout(r, Math.min(20000, 1000 * 2 ** attempt)));
+      await sleep(Math.min(20000, 1000 * 2 ** attempt));
       continue;
     }
     if (resp.ok) return resp.json();
     let detail = "";
+    let rawDetails = "";
     let bodyRetrySeconds = NaN;
     try {
       const j = await resp.json();
       detail = (j.error && j.error.message) || "";
+      rawDetails = JSON.stringify((j.error && j.error.details) || []);
       const info = ((j.error && j.error.details) || []).find((d) => d && d.retryDelay);
       if (info) bodyRetrySeconds = parseFloat(info.retryDelay);
     } catch {
       // body was not JSON
+    }
+    if (resp.status === 429 && (/PerDay|per day|daily/i.test(rawDetails) || /per day|daily/i.test(detail))) {
+      throw new Error(`${name} daily free limit reached (${detail.slice(0, 100)}). Try again tomorrow or use a different key.`);
     }
     lastErr = new Error(`${name} HTTP ${resp.status}${detail ? ": " + detail.slice(0, 160) : ""}`);
     const retryable = resp.status === 429 || resp.status === 529 || resp.status >= 500;
     if (!retryable || attempt === attempts - 1) throw lastErr;
     const headerSeconds = Number(resp.headers.get("retry-after"));
     const seconds = headerSeconds > 0 ? headerSeconds : bodyRetrySeconds > 0 ? bodyRetrySeconds : 2 ** attempt;
-    await new Promise((r) => setTimeout(r, Math.min(65000, seconds * 1000)));
+    const waitMs = Math.min(65000, seconds * 1000);
+    if (waitedMs + waitMs > 90000) throw lastErr;
+    waitedMs += waitMs;
+    if (note) note(`${name} is busy or rate-limiting; waiting ${Math.ceil(waitMs / 1000)}s before retrying...`);
+    await sleep(waitMs);
   }
   throw lastErr;
 }
 
-async function callAnthropic(body, attempts = 4, key = process.env.ANTHROPIC_API_KEY) {
+async function callAnthropic(body, attempts = 4, key = process.env.ANTHROPIC_API_KEY, note) {
   return postJsonWithRetry(
     "Claude API",
     ANTHROPIC_API_URL,
     { "x-api-key": key, "anthropic-version": "2023-06-01" },
     body,
-    attempts
+    attempts,
+    note
   );
 }
 
 // parts: Gemini "parts" array (text and/or inline_data). Returns the reply text.
-async function callGemini(parts, attempts = 6, key = process.env.GEMINI_API_KEY) {
+async function callGemini(parts, attempts = 4, key = process.env.GEMINI_API_KEY, note) {
   async function generate(model) {
     const data = await postJsonWithRetry(
       "Gemini API",
       `${geminiBase()}/models/${model}:generateContent`,
       { "x-goog-api-key": key },
       { contents: [{ parts }], generationConfig: { temperature: 0, maxOutputTokens: 256 } },
-      attempts
+      attempts,
+      note
     );
     const cand = (data.candidates || [])[0];
     return ((cand && cand.content && cand.content.parts) || []).map((p) => p.text || "").join(" ");
@@ -425,62 +451,147 @@ async function callGemini(parts, attempts = 6, key = process.env.GEMINI_API_KEY)
   }
 }
 
-async function classifyVehicleView(buf, ext, workDir, ai) {
-  const img = await prepareForClassification(buf, ext, workDir);
-  if (!img) return "other";
+const VIEW_WORDS = { front: "front", left: "left", right: "right", back: "back", rear: "back", other: "other" };
+
+// Asks the AI about several photos in ONE request. items: [{ buf, ext }]. Returns one view (or null when
+// the answer did not cover that photo) per item.
+async function classifyBatch(items, workDir, ai, note) {
+  const result = new Array(items.length).fill(null);
+  const sent = [];
+  const images = [];
+  for (let i = 0; i < items.length; i++) {
+    const img = await prepareForClassification(items[i].buf, items[i].ext, workDir);
+    if (img) {
+      sent.push(i);
+      images.push(img);
+    } else {
+      result[i] = "other";
+    }
+  }
+  if (images.length === 0) return result;
+  const prompt = batchPrompt(images.length);
   let text;
   if (ai.provider === "gemini") {
-    text = await callGemini([
-      { inline_data: { mime_type: img.mediaType, data: img.data.toString("base64") } },
-      { text: VIEW_PROMPT },
-    ], 6, ai.key);
+    const parts = [];
+    images.forEach((img, k) => {
+      parts.push({ text: `Image ${k + 1}:` });
+      parts.push({ inline_data: { mime_type: img.mediaType, data: img.data.toString("base64") } });
+    });
+    parts.push({ text: prompt });
+    text = await callGemini(parts, 4, ai.key, note);
   } else {
-    const data = await callAnthropic({
-      model: orderingModel(),
-      max_tokens: 10,
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "image", source: { type: "base64", media_type: img.mediaType, data: img.data.toString("base64") } },
-            { type: "text", text: VIEW_PROMPT },
-          ],
-        },
-      ],
-    }, 4, ai.key);
+    const content = [];
+    images.forEach((img, k) => {
+      content.push({ type: "text", text: `Image ${k + 1}:` });
+      content.push({ type: "image", source: { type: "base64", media_type: img.mediaType, data: img.data.toString("base64") } });
+    });
+    content.push({ type: "text", text: prompt });
+    const data = await callAnthropic(
+      { model: orderingModel(), max_tokens: 20 + images.length * 12, messages: [{ role: "user", content }] },
+      4,
+      ai.key,
+      note
+    );
     text = ((data.content || []).find((c) => c.type === "text") || {}).text || "";
   }
-  const word = text.toLowerCase().match(/front|left|right|back|rear|other/);
-  if (!word) return "other";
-  return word[0] === "rear" ? "back" : word[0];
+  const lower = text.toLowerCase();
+  for (const m of lower.matchAll(/(\d+)\s*[:.)-]\s*\**\s*(front|left|right|back|rear|other)/g)) {
+    const n = Number(m[1]);
+    if (n >= 1 && n <= images.length && !result[sent[n - 1]]) result[sent[n - 1]] = VIEW_WORDS[m[2]];
+  }
+  if (images.length === 1 && !result[sent[0]]) {
+    const single = lower.match(/front|left|right|back|rear|other/);
+    if (single) result[sent[0]] = VIEW_WORDS[single[0]];
+  }
+  return result;
 }
 
-// items: [{ buf, ext }] in PDF order. Returns them with a .view label, sorted front, left, right,
-// back, other; photos with the same view keep their original relative order.
-async function orderByVehicleView(items, workDir, job, label, preclassify) {
-  const ai = aiConfigFor(job);
-  const views = new Array(items.length);
-  let failed = 0;
-  let firstError = null;
+function withDeadline(promise, ms) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error("time limit reached")), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+// Sends the photos at `indices` to the AI in batches, with a time limit for the whole report. Photos the
+// AI could not place stay null (the caller puts them under "other"). Two failed batches in a row switch
+// the AI off for the rest of the job, so a broken or used-up key can never keep a run waiting.
+async function classifyInBatches(items, indices, views, ai, workDir, job, label) {
+  const batches = [];
+  for (let i = 0; i < indices.length; i += BATCH_SIZE) batches.push(indices.slice(i, i + BATCH_SIZE));
+  const who = ai.provider === "gemini" ? "Google Gemini" : "Claude";
+  log(job, `Arranging ${indices.length} photo(s) in "${label}" with ${who} (${batches.length} request(s)); this can take a minute or two on a free key.`);
+  const deadline = Date.now() + ORDERING_BUDGET_MS;
+  const note = (msg) => {
+    job.waitNotes = (job.waitNotes || 0) + 1;
+    if (job.waitNotes <= 6) log(job, msg);
+  };
   let next = 0;
+  let failedPhotos = 0;
+  let firstError = null;
+  let timedOut = false;
+  let successes = 0;
   async function worker() {
     while (true) {
-      const i = next++;
-      if (i >= items.length) return;
+      const b = next++;
+      if (b >= batches.length) return;
+      if (job.aiDisabled) continue;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        timedOut = true;
+        continue;
+      }
       try {
-        const known = preclassify ? await preclassify(items[i]) : null;
-        views[i] = known || (await classifyVehicleView(items[i].buf, items[i].ext, workDir, ai));
+        const labels = await withDeadline(classifyBatch(batches[b].map((i) => items[i]), workDir, ai, note), remaining);
+        labels.forEach((v, k) => {
+          if (v) views[batches[b][k]] = v;
+        });
+        job.aiFailures = 0;
+        successes++;
       } catch (err) {
-        views[i] = "other";
-        failed++;
-        firstError = firstError || err.message;
+        failedPhotos += batches[b].length;
+        if (err.message === "time limit reached") {
+          timedOut = true;
+        } else {
+          firstError = firstError || err.message;
+          job.aiFailures = (job.aiFailures || 0) + 1;
+          if (job.aiFailures >= 2) job.aiDisabled = true;
+        }
       }
     }
   }
-  await Promise.all(Array.from({ length: Math.min(ai.provider === "gemini" ? 2 : 4, items.length) }, worker));
-  if (failed) log(job, `Could not classify ${failed} photo(s) in "${label}" (${firstError}); they were placed under other.`);
+  await Promise.all(Array.from({ length: Math.min(ai.provider === "gemini" ? 1 : 2, batches.length) }, worker));
+  if (timedOut && successes === 0) {
+    // the service never answered for this whole report; two reports like that in a row switch it off
+    job.aiFailures = (job.aiFailures || 0) + 1;
+    if (job.aiFailures >= 2) job.aiDisabled = true;
+  }
+  if (firstError) log(job, `Could not arrange ${failedPhotos} photo(s) in "${label}" (${firstError}); they were placed under other.`);
+  if (timedOut) log(job, `Photo ordering for "${label}" stopped after ${Math.round(ORDERING_BUDGET_MS / 1000)} seconds; photos not yet placed went under other.`);
+  if (job.aiDisabled && !job.aiDisabledLogged) {
+    job.aiDisabledLogged = true;
+    log(job, "Photo ordering is switched off for the rest of this run because the AI service kept failing. Check the key with the (test) link.");
+  }
+}
+
+// items: [{ buf, ext }] in PDF order. Returns them with a .view label, sorted front, left, right,
+// back, other; photos with the same view keep their original relative order. preclassify (optional)
+// can place a photo without the AI (by file name, or because it is tiny or flat).
+async function orderByVehicleView(items, workDir, job, label, preclassify) {
+  const ai = aiConfigFor(job);
+  const views = new Array(items.length).fill(null);
+  const todo = [];
+  for (let i = 0; i < items.length; i++) {
+    const known = preclassify ? await preclassify(items[i]) : null;
+    if (known) views[i] = known;
+    else todo.push(i);
+  }
+  if (todo.length > 0 && !job.aiDisabled) {
+    await classifyInBatches(items, todo, views, ai, workDir, job, label);
+  }
   return items
-    .map((item, idx) => ({ ...item, view: views[idx], idx }))
+    .map((item, idx) => ({ ...item, view: views[idx] || "other", idx }))
     .sort((a, b) => VIEW_ORDER.indexOf(a.view) - VIEW_ORDER.indexOf(b.view) || a.idx - b.idx);
 }
 
@@ -683,7 +794,7 @@ async function saveFetchedContent(buf, contentType, workDir, label, archive, see
 async function handleNextcloudShare(url, reqHeaders, workDir, label, archive, seenHashes, job) {
   const downloadUrl = url.replace(/\/+$/, "") + "/download";
   const headers = { ...BROWSER_LIKE_HEADERS, ...reqHeaders };
-  const resp = await fetch(downloadUrl, { headers, redirect: "follow" });
+  const resp = await fetch(downloadUrl, { headers, redirect: "follow", signal: AbortSignal.timeout(180000) });
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
   const contentType = (resp.headers.get("content-type") || "").toLowerCase();
   const buf = Buffer.from(await resp.arrayBuffer());
@@ -692,7 +803,7 @@ async function handleNextcloudShare(url, reqHeaders, workDir, label, archive, se
 
 async function handleGenericDownload(url, reqHeaders, workDir, label, archive, seenHashes, job) {
   const headers = { ...BROWSER_LIKE_HEADERS, ...reqHeaders };
-  const resp = await fetch(url, { headers, redirect: "follow" });
+  const resp = await fetch(url, { headers, redirect: "follow", signal: AbortSignal.timeout(180000) });
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
   const contentType = (resp.headers.get("content-type") || "").toLowerCase();
   const buf = Buffer.from(await resp.arrayBuffer());
@@ -891,7 +1002,7 @@ async function handleHtmlPageWithScreenshot(url, reqHeaders, browser, label, arc
 
 async function handleSmartReport(url, reqHeaders, workDir, label, archive, seenHashes, job, ensureBrowser) {
   const headers = { ...BROWSER_LIKE_HEADERS, ...reqHeaders };
-  const resp = await fetch(url, { headers, redirect: "follow" });
+  const resp = await fetch(url, { headers, redirect: "follow", signal: AbortSignal.timeout(180000) });
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
   const contentType = (resp.headers.get("content-type") || "").toLowerCase();
   const buf = Buffer.from(await resp.arrayBuffer());

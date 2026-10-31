@@ -84,3 +84,10 @@ call, and tiny or flat graphics go to "other". Page renders and PDFs are never r
 The tool page has a "Photo ordering key" box at the top. A key pasted there (a Gemini key, or a Claude key
 starting `sk-ant-`) is saved only in that browser and sent only when a job starts. The server does not store
 it. The "Test key" link next to the box checks it. Keys set in Render's Environment tab still work.
+
+### Ordering never holds up a run
+
+Photos are sent to the AI several at a time (6 per request), so a free key's few-requests-a-minute limit is
+enough. Each request has a time limit, arranging one report's photos is capped at 2.5 minutes, a used-up
+daily limit is not retried, and two failed reports in a row switch ordering off for the rest of that run.
+Photos the AI could not place go under "other" and the activity log says why.
