@@ -271,7 +271,7 @@ async function prepareForClassification(buf, ext, workDir) {
   const outPath = path.join(workDir, `cls-${uuid()}.jpg`);
   try {
     fs.writeFileSync(inPath, buf);
-    await execFileAsync("gm", ["convert", inPath, "-resize", "512x512>", "-quality", "70", outPath]);
+    await execFileAsync("gm", ["convert", "-size", "512x512", inPath, "-resize", "512x512>", "-quality", "70", outPath]);
     return { data: fs.readFileSync(outPath), mediaType: "image/jpeg" };
   } catch {
     if (buf.length < 4 * 1024 * 1024 && [".jpg", ".jpeg", ".png"].includes(ext)) {
@@ -380,6 +380,7 @@ async function postJsonWithRetry(name, url, headers, body, attempts, note) {
       const timedOut = err && (err.name === "AbortError" || err.name === "TimeoutError");
       lastErr = new Error(`could not reach ${name} (${timedOut ? "no answer in time" : err.message})`);
       if (attempt === attempts - 1) throw lastErr;
+      if (timedOut && note) note(`${name} did not answer within ${Math.round(AI_TIMEOUT_MS / 1000)}s; trying again...`);
       await sleep(Math.min(20000, 1000 * 2 ** attempt));
       continue;
     }
@@ -460,7 +461,7 @@ async function classifyBatch(items, workDir, ai, note) {
   const sent = [];
   const images = [];
   for (let i = 0; i < items.length; i++) {
-    const img = await prepareForClassification(items[i].buf, items[i].ext, workDir);
+    const img = items[i].thumb !== undefined ? items[i].thumb : await prepareForClassification(items[i].buf, items[i].ext, workDir);
     if (img) {
       sent.push(i);
       images.push(img);
@@ -522,6 +523,20 @@ async function classifyInBatches(items, indices, views, ai, workDir, job, label)
   for (let i = 0; i < indices.length; i += BATCH_SIZE) batches.push(indices.slice(i, i + BATCH_SIZE));
   const who = ai.provider === "gemini" ? "Google Gemini" : "Claude";
   log(job, `Arranging ${indices.length} photo(s) in "${label}" with ${who} (${batches.length} request(s)); this can take a minute or two on a free key.`);
+  // Shrink the photos once, two at a time. This is CPU work and can be slow on a small server, so it is
+  // timed in the log and is not counted against the AI time limit below.
+  const prepStart = Date.now();
+  let prepNext = 0;
+  async function prepWorker() {
+    while (true) {
+      const k = prepNext++;
+      if (k >= indices.length) return;
+      const it = items[indices[k]];
+      if (it.thumb === undefined) it.thumb = await prepareForClassification(it.buf, it.ext, workDir);
+    }
+  }
+  await Promise.all([prepWorker(), prepWorker()]);
+  log(job, `Prepared ${indices.length} thumbnail(s) for "${label}" in ${Math.round((Date.now() - prepStart) / 1000)}s.`);
   const deadline = Date.now() + ORDERING_BUDGET_MS;
   const note = (msg) => {
     job.waitNotes = (job.waitNotes || 0) + 1;
@@ -542,6 +557,7 @@ async function classifyInBatches(items, indices, views, ai, workDir, job, label)
         timedOut = true;
         continue;
       }
+      const started = Date.now();
       try {
         const labels = await withDeadline(classifyBatch(batches[b].map((i) => items[i]), workDir, ai, note), remaining);
         labels.forEach((v, k) => {
@@ -549,6 +565,7 @@ async function classifyInBatches(items, indices, views, ai, workDir, job, label)
         });
         job.aiFailures = 0;
         successes++;
+        log(job, `Photo batch ${b + 1} of ${batches.length} answered in ${Math.round((Date.now() - started) / 1000)}s.`);
       } catch (err) {
         failedPhotos += batches[b].length;
         if (err.message === "time limit reached") {
